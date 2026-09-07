@@ -1,5 +1,14 @@
 -- Casework schema. Applied fresh to both the dev DB (docker-compose "db") and
 -- the disposable integration-test DB (docker-compose "db_test").
+--
+-- This hand-written file -- not Alembic -- is the source of truth for DDL;
+-- backend/app/infrastructure/db/models/ (SQLAlchemy) is a query/persistence
+-- layer over the schema defined here, not a migration tool, so the two must
+-- be kept in sync by hand. That's a deliberate, acceptable simplification
+-- for a project this size (5 tables, changing rarely). In production, use
+-- Alembic to autogenerate migrations from the SQLAlchemy models instead, so
+-- the models become the single source of truth and this file's job is done
+-- by versioned migration scripts.
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;  -- gen_random_uuid()
 
