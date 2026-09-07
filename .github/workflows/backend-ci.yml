@@ -1,0 +1,63 @@
+name: backend-ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "db/**"
+      - ".github/workflows/backend-ci.yml"
+  pull_request:
+    paths:
+      - "backend/**"
+      - "db/**"
+      - ".github/workflows/backend-ci.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: casework
+          POSTGRES_PASSWORD: casework
+          POSTGRES_DB: casework_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U casework"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply schema to the test database
+        run: PGPASSWORD=casework psql -h localhost -U casework -d casework_test -f db/schema.sql
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        working-directory: backend
+        run: uv sync
+
+      - name: Lint
+        working-directory: backend
+        run: uv run ruff check .
+
+      - name: Unit + integration tests
+        working-directory: backend
+        env:
+          TEST_DATABASE_URL: postgresql://casework:casework@localhost:5432/casework_test
+        run: uv run pytest -q
