@@ -1,4 +1,5 @@
 import os
+from collections.abc import AsyncIterator
 
 import pytest_asyncio
 from fastapi import Depends
@@ -50,7 +51,7 @@ async def test_sessionmaker():
 
 
 @pytest_asyncio.fixture
-async def test_session(test_sessionmaker) -> AsyncSession:
+async def test_session(test_sessionmaker) -> AsyncIterator[AsyncSession]:
     async with test_sessionmaker() as session:
         yield session
 

@@ -59,6 +59,13 @@ class SqlAlchemyCasesRepository(CasesRepository):
         self, case_id: UUID, *, resolution: Resolution, status: CaseStatus, approved_by: str | None
     ) -> Case:
         row = await self._session.get(CaseModel, case_id)
+        if row is None:
+            # Callers are expected to have already confirmed the case exists
+            # (CasesService does, via get()) -- this only fires on a race
+            # (deleted between that check and this call), but the type
+            # checker is right that session.get() can return None and this
+            # must not silently AttributeError on the next line.
+            raise LookupError(f"No case with id {case_id}")
         row.resolution = resolution.value
         row.status = status.value
         row.approved_by = approved_by

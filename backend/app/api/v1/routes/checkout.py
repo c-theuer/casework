@@ -43,6 +43,9 @@ async def checkout(
             message=f"Charge succeeded, but the triage pipeline failed: {result.pipeline_error}",
         )
 
+    # CheckoutService guarantees exactly one of `case`/`pipeline_error` is
+    # set; `pipeline_error` was already ruled out above.
+    assert result.case is not None
     return CheckoutResponse(
         charge_succeeded=True,
         risk_level=result.risk_level,

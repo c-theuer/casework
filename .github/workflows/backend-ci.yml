@@ -56,6 +56,10 @@ jobs:
         working-directory: backend
         run: uv run ruff check .
 
+      - name: Type-check
+        working-directory: backend
+        run: uv run mypy app tests
+
       - name: Unit + integration tests
         working-directory: backend
         env:
