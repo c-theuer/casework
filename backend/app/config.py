@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     stripe_secret_key: str = ""
     slack_bot_token: str = ""
+    slack_team_id: str = ""
     slack_fraud_ops_channel: str = "#fraud-ops"
     github_pat: str = ""
     github_demo_repo: str = ""

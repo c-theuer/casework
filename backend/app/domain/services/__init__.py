@@ -5,7 +5,7 @@ from app.domain.services.cases_service import (
 )
 from app.domain.services.checkout_service import (
     TEST_CARDS,
-    ChargeDeclinedError,
+    AuthorizationDeclinedError,
     CheckoutResult,
     CheckoutService,
 )
@@ -17,10 +17,10 @@ from app.domain.services.coordinator_service import (
 
 __all__ = [
     "TEST_CARDS",
+    "AuthorizationDeclinedError",
     "CaseAlreadyResolvedError",
     "CaseNotFoundError",
     "CasesService",
-    "ChargeDeclinedError",
     "CheckoutResult",
     "CheckoutService",
     "CoordinatorError",

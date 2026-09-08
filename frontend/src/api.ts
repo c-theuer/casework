@@ -18,7 +18,7 @@ export interface CheckoutRequest {
 }
 
 export interface CheckoutResponse {
-  charge_succeeded: boolean;
+  authorized: boolean;
   risk_level: string | null;
   payment_intent_id: string | null;
   signal_created: boolean;

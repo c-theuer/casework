@@ -40,4 +40,6 @@ class CaseEventType(StrEnum):
     ACTION_EXECUTED = "action_executed"
     LOGGED_ONLY = "logged_only"
     ROUTE_RECOMMENDATION_MISMATCH = "route_recommendation_mismatch"
+    PAYMENT_CAPTURED = "payment_captured"
+    PAYMENT_CANCELLED = "payment_cancelled"
     ERROR = "error"

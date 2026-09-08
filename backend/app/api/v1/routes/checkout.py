@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends
 
 from app.api.dependencies import get_checkout_service
 from app.api.schemas import CheckoutRequest, CheckoutResponse
-from app.domain.services import ChargeDeclinedError, CheckoutService
+from app.domain.services import AuthorizationDeclinedError, CheckoutService
 
 router = APIRouter(tags=["checkout"])
 
@@ -24,34 +24,34 @@ async def checkout(
             failed_logins_this_session=request.failed_logins_this_session,
             test_card=request.test_card,
         )
-    except ChargeDeclinedError as exc:
+    except AuthorizationDeclinedError as exc:
         # Stripe blocked it before we ever created a Signal -- the
         # architecture boundary the always-blocked test card demonstrates.
         return CheckoutResponse(
-            charge_succeeded=False,
+            authorized=False,
             risk_level=exc.risk_level,
             signal_created=False,
-            message="Charge declined by Stripe Radar. Casework never saw this transaction.",
+            message="Authorization declined by Stripe Radar. Casework never saw this transaction.",
         )
 
     if result.pipeline_error:
         return CheckoutResponse(
-            charge_succeeded=True,
+            authorized=True,
             risk_level=result.risk_level,
             payment_intent_id=result.payment_intent_id,
             signal_created=True,
-            message=f"Charge succeeded, but the triage pipeline failed: {result.pipeline_error}",
+            message=f"Authorization succeeded, but the triage pipeline failed: {result.pipeline_error}",
         )
 
     # CheckoutService guarantees exactly one of `case`/`pipeline_error` is
     # set; `pipeline_error` was already ruled out above.
     assert result.case is not None
     return CheckoutResponse(
-        charge_succeeded=True,
+        authorized=True,
         risk_level=result.risk_level,
         payment_intent_id=result.payment_intent_id,
         signal_created=True,
         case_id=result.case.case_id,
         case_status=result.case.status.value,
-        message="Charge succeeded and a case was created.",
+        message="Authorization succeeded and a case was created.",
     )

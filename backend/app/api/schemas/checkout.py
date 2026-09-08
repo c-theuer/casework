@@ -17,7 +17,7 @@ class CheckoutRequest(BaseModel):
 
 
 class CheckoutResponse(BaseModel):
-    charge_succeeded: bool
+    authorized: bool
     risk_level: str | None = None
     payment_intent_id: str | None = None
     signal_created: bool

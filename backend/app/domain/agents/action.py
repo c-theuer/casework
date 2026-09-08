@@ -6,9 +6,10 @@ from app.domain.entities import ActionResult, Case
 class ActionAgent(Protocol):
     """Port for the Action Agent (spec §3.04): the only agent that touches
     real external systems. notify() is Slack-only (fired pre-approval on
-    the critical path); execute() is Stripe+Slack+GitHub (fired only after
-    a human approves) -- Phase 2's adapter enforces that split via which
-    MCP servers each method is allowed to reach, never both at once."""
+    the critical path); execute() is Slack+GitHub (fired only after a
+    human approves). Neither ever touches Stripe -- capturing or
+    cancelling the held PaymentIntent is a deterministic decision made by
+    CasesService, not something delegated to an LLM."""
 
     async def notify(self, case: Case) -> ActionResult: ...
 

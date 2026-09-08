@@ -223,4 +223,5 @@ def _build_case_dto(
         route=route,
         status=status,
         source=source,
+        stripe_payment_intent_id=signal.payload.get("stripe_payment_intent_id"),
     )

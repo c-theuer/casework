@@ -12,11 +12,13 @@ from app.api.dependencies import (
     get_checkout_service,
     get_coordinator_service,
     get_db_session,
+    get_payment_gateway,
     get_research_agent,
     get_synthesis_agent,
     get_triage_agent,
 )
 from app.domain.entities import CaseSource
+from app.domain.gateways import PaymentGateway
 from app.domain.services import CheckoutService, CoordinatorService
 from app.infrastructure.agents import (
     StubActionAgent,
@@ -25,6 +27,7 @@ from app.infrastructure.agents import (
     StubTriageAgent,
 )
 from app.infrastructure.db import session as db_session
+from app.infrastructure.payments.stub_gateway import StubPaymentGateway
 from app.infrastructure.repositories import (
     SqlAlchemyCaseEventsRepository,
     SqlAlchemyCasesRepository,
@@ -68,11 +71,12 @@ async def case_events_repo(test_session):
 
 def _checkout_service_tagged_for_tests(
     coordinator: CoordinatorService = Depends(get_coordinator_service),
+    payment_gateway: PaymentGateway = Depends(get_payment_gateway),
 ) -> CheckoutService:
     # Tagging cases as `integration_test` (instead of the real `live_stripe`
     # a production checkout would use) is what lets the teardown below clean
     # up safely without ever touching rows a manual local dev session made.
-    return CheckoutService(coordinator, source=CaseSource.INTEGRATION_TEST)
+    return CheckoutService(coordinator, payment_gateway, source=CaseSource.INTEGRATION_TEST)
 
 
 @pytest_asyncio.fixture
@@ -89,6 +93,7 @@ async def client(test_sessionmaker, test_session):
     app.dependency_overrides[get_research_agent] = lambda: StubResearchAgent()
     app.dependency_overrides[get_synthesis_agent] = lambda: StubSynthesisAgent()
     app.dependency_overrides[get_action_agent] = lambda: StubActionAgent()
+    app.dependency_overrides[get_payment_gateway] = lambda: StubPaymentGateway()
     app.dependency_overrides[get_checkout_service] = _checkout_service_tagged_for_tests
 
     transport = ASGITransport(app=app)

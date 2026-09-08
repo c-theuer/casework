@@ -152,14 +152,14 @@ export function Checkout() {
         </fieldset>
 
         <button type="submit" disabled={submitting}>
-          {submitting ? "Charging…" : "Submit charge"}
+          {submitting ? "Authorizing…" : "Submit order"}
         </button>
       </form>
 
       {error && <div className="banner error">{error}</div>}
 
       {result && (
-        <div className={`banner ${result.charge_succeeded ? "success" : "declined"}`}>
+        <div className={`banner ${result.authorized ? "success" : "declined"}`}>
           <p>{result.message}</p>
           <dl>
             {result.risk_level && (

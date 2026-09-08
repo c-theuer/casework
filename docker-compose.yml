@@ -6,7 +6,13 @@ services:
       POSTGRES_PASSWORD: casework
       POSTGRES_DB: casework
     ports:
-      - "5432:5432"
+      # Mapped off the default 5432 so this never silently loses a port
+      # fight with a system-level Postgres a dev machine happens to have
+      # running (verified this was a real, not theoretical, problem: a
+      # native Homebrew postgresql@18 service was winning that port,
+      # so every host-side script/tool connecting to "localhost:5432"
+      # was silently talking to the wrong database).
+      - "5434:5432"
     volumes:
       - db_data:/var/lib/postgresql/data
       - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro

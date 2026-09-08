@@ -9,7 +9,7 @@ USER="${PGUSER:-casework}"
 export PGPASSWORD="${PGPASSWORD:-casework}"
 
 for db in casework casework_test; do
-    port="5432"
+    port="5434"
     [ "$db" = "casework_test" ] && port="5433"
     echo "Applying schema to $db on port $port..."
     psql -h "$HOST" -p "$port" -U "$USER" -d "$db" -f "$(dirname "$0")/../db/schema.sql"

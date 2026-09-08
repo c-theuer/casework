@@ -18,7 +18,7 @@ class TestCheckoutEndpoint:
 
         assert response.status_code == 200
         body = response.json()
-        assert body["charge_succeeded"] is True
+        assert body["authorized"] is True
         assert body["risk_level"] == "elevated"
         assert body["signal_created"] is True
         assert body["case_status"] == "pending_review"
@@ -38,7 +38,7 @@ class TestCheckoutEndpoint:
         )
 
         body = response.json()
-        assert body["charge_succeeded"] is True
+        assert body["authorized"] is True
         assert body["case_status"] == "auto_escalated"
 
     async def test_always_blocked_card_never_creates_a_signal(self, client):
@@ -56,7 +56,7 @@ class TestCheckoutEndpoint:
 
         assert response.status_code == 200
         body = response.json()
-        assert body["charge_succeeded"] is False
+        assert body["authorized"] is False
         assert body["signal_created"] is False
         assert body["case_id"] is None
 
