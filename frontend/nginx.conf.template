@@ -1,0 +1,14 @@
+server {
+    listen ${PORT};
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # react-router-dom uses client-side routing -- any path not matching a
+    # real file (e.g. /queue) must still serve index.html so the SPA's own
+    # router can take over, instead of nginx 404ing it.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
