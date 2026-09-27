@@ -31,6 +31,7 @@ from app.infrastructure.payments.stub_gateway import StubPaymentGateway
 from app.infrastructure.repositories import (
     SqlAlchemyCaseEventsRepository,
     SqlAlchemyCasesRepository,
+    SqlAlchemySignalsLogRepository,
 )
 from app.main import app
 
@@ -67,6 +68,11 @@ async def cases_repo(test_session):
 @pytest_asyncio.fixture
 async def case_events_repo(test_session):
     return SqlAlchemyCaseEventsRepository(test_session)
+
+
+@pytest_asyncio.fixture
+async def signals_log_repo(test_session):
+    return SqlAlchemySignalsLogRepository(test_session)
 
 
 def _checkout_service_tagged_for_tests(
