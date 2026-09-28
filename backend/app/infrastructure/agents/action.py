@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from app.config import Settings
 from app.domain.agents import ActionAgent
 from app.domain.entities import ActionResult, Case
-from app.infrastructure.agents.base import run_agent_freeform
+from app.infrastructure.agents.base import STATUS_FAILED, STATUS_SUCCESS, run_agent_freeform
 from app.infrastructure.mcp.config import github_mcp_server, slack_mcp_server
 
 _NOTIFY_SYSTEM_PROMPT = """You are the Action Agent in Casework, a \
@@ -23,7 +23,14 @@ an id.
 Post exactly one message to the matched channel. Include: the account, the \
 triaged pattern, the drafted case note, the recommended action, and a \
 line telling the analyst to approve or deny it from the fraud-ops queue. \
-Then briefly confirm what you posted."""
+Then briefly confirm what you posted.
+
+End your response with exactly one line, and nothing after it: \
+"{status_success}" if slack_post_message actually returned success, or \
+"{status_failed}" for any other outcome -- including a missing channel, a \
+missing permission/scope, or any other tool error. Never write \
+"{status_success}" unless the message was truly posted; a plausible-sounding \
+explanation of what you *meant* to do is not success."""
 
 _EXECUTE_SYSTEM_PROMPT = """You are the Action Agent in Casework, a \
 fraud-signal triage system for a bank's fraud-ops team. A human analyst \
@@ -50,7 +57,15 @@ guessing an id.
 account and pattern, a body with the full case details, approver, and \
 payment outcome, labeled with the case's tier.
 
-Once finished, briefly confirm what you did."""
+Once finished, briefly confirm what you did.
+
+End your response with exactly one line, and nothing after it: \
+"{status_success}" if -- and only if -- BOTH the Slack post and the GitHub \
+issue were actually created, or "{status_failed}" for any other outcome, \
+including completing only one of the two, a missing channel, a missing \
+permission/scope, or any other tool error. Never write "{status_success}" \
+unless both actions truly completed; a plausible-sounding explanation of \
+what you *meant* to do is not success."""
 
 _PAYMENT_NOTE_BLOCK = "the held PaymentIntent {payment_intent_id} was cancelled, no charge will ever complete."
 _PAYMENT_NOTE_ALLOW = "the held PaymentIntent {payment_intent_id} was captured, the charge is now final."
@@ -77,15 +92,19 @@ class ClaudeActionAgent(ActionAgent):
             f"Channel: {self._settings.slack_fraud_ops_channel}\n\n"
             f"Case:\n{json.dumps(case.model_dump(mode='json'), default=str)}"
         )
+        system_prompt = _NOTIFY_SYSTEM_PROMPT.format(
+            status_success=STATUS_SUCCESS, status_failed=STATUS_FAILED
+        )
         raw_text = await run_agent_freeform(
             agent_name="ActionAgent.notify",
-            system_prompt=_NOTIFY_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             prompt=prompt,
             mcp_servers={"slack": slack_mcp_server(self._settings)},
             allowed_tools=[
                 "mcp__slack__slack_list_channels",
                 "mcp__slack__slack_post_message",
             ],
+            required_tools=["mcp__slack__slack_post_message"],
         )
         return ActionResult(
             signal_id=case.signal_id,
@@ -109,7 +128,9 @@ class ClaudeActionAgent(ActionAgent):
         else:
             payment_note = _PAYMENT_NOTE_ALLOW.format(payment_intent_id=case.stripe_payment_intent_id)
 
-        system_prompt = _EXECUTE_SYSTEM_PROMPT.format(payment_note=payment_note)
+        system_prompt = _EXECUTE_SYSTEM_PROMPT.format(
+            payment_note=payment_note, status_success=STATUS_SUCCESS, status_failed=STATUS_FAILED
+        )
         prompt = (
             f"Channel: {self._settings.slack_fraud_ops_channel}\n"
             f"GitHub repo: {self._settings.github_demo_repo}\n"
@@ -129,6 +150,7 @@ class ClaudeActionAgent(ActionAgent):
                 "mcp__slack__slack_post_message",
                 "mcp__github__create_issue",
             ],
+            required_tools=["mcp__slack__slack_post_message", "mcp__github__create_issue"],
         )
         return ActionResult(
             signal_id=case.signal_id,

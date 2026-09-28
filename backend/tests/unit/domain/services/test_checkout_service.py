@@ -1,4 +1,5 @@
 from unittest.mock import AsyncMock
+from uuid import uuid4
 
 import pytest
 
@@ -104,11 +105,14 @@ class TestCheckoutService:
         coordinator.handle_signal.assert_not_called()
         assert payment_gateway.captured == []
 
-    async def test_pipeline_failure_after_charge_is_reported_not_raised(self):
+    async def test_pipeline_failure_with_no_case_created_cancels_the_dangling_authorization(self):
         """The auth path is independent of the investigation queue: a
-        downstream pipeline failure must not take down the charge result."""
+        downstream pipeline failure must not take down the charge result --
+        but with no case ever created, there's no human-review path this
+        authorization could ever reach, so it must be actively cancelled
+        rather than left dangling until Stripe's own 7-day auto-cancel."""
         service, coordinator, payment_gateway = make_service()
-        coordinator.handle_signal.side_effect = CoordinatorError("sig_1", "triage", RuntimeError("x"))
+        coordinator.handle_signal.side_effect = CoordinatorError("sig_1", "triage", RuntimeError("x"), case_id=None)
 
         result = await service.checkout(
             account_id="acct_1",
@@ -125,4 +129,60 @@ class TestCheckoutService:
         assert result.risk_level == "elevated"
         assert result.case is None
         assert result.pipeline_error is not None
+        assert "cancelled" in result.pipeline_error
         assert payment_gateway.captured == []
+        assert payment_gateway.cancelled == [result.payment_intent_id]
+
+    async def test_pipeline_failure_reports_clearly_when_cancelling_also_fails(self):
+        """Never a raw exception/500 even in the double-failure case --
+        still a 200 with a message flagging it for manual review."""
+        coordinator = AsyncMock()
+        coordinator.handle_signal.side_effect = CoordinatorError("sig_1", "triage", RuntimeError("x"), case_id=None)
+        payment_gateway = AsyncMock()
+        payment_gateway.authorize.return_value.risk_level = "elevated"
+        payment_gateway.authorize.return_value.payment_intent_id = "pi_test_1"
+        payment_gateway.cancel.side_effect = RuntimeError("stripe unreachable")
+        service = CheckoutService(coordinator, payment_gateway)
+
+        result = await service.checkout(
+            account_id="acct_1",
+            amount=10.0,
+            merchant_id="m1",
+            device_context="known_device",
+            geo_context="usual_location",
+            recent_password_reset=False,
+            mfa_completed=True,
+            failed_logins_this_session=0,
+            test_card="elevated",
+        )
+
+        assert result.pipeline_error is not None
+        assert "also failed" in result.pipeline_error
+        assert "pi_test_1" in result.pipeline_error
+
+    async def test_pipeline_failure_with_a_case_created_leaves_the_authorization_alone(self):
+        """Once a case exists (e.g. only the notify() stage failed), it's
+        queued/escalated normally and the analyst's approve/deny is the
+        correct way to resolve its payment -- cancelling behind its back
+        here would corrupt that case's state."""
+        service, coordinator, payment_gateway = make_service()
+        case_id = uuid4()
+        coordinator.handle_signal.side_effect = CoordinatorError(
+            "sig_1", "notify", RuntimeError("missing_scope"), case_id=case_id
+        )
+
+        result = await service.checkout(
+            account_id="acct_1",
+            amount=10.0,
+            merchant_id="m1",
+            device_context="known_device",
+            geo_context="usual_location",
+            recent_password_reset=False,
+            mfa_completed=True,
+            failed_logins_this_session=0,
+            test_card="elevated",
+        )
+
+        assert result.pipeline_error is not None
+        assert payment_gateway.captured == []
+        assert payment_gateway.cancelled == []

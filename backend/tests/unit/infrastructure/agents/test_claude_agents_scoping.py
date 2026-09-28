@@ -131,6 +131,9 @@ class TestClaudeActionAgentScoping:
         _, kwargs = mock_run.call_args
         assert set(kwargs["mcp_servers"].keys()) == {"slack"}
         assert all(tool.startswith("mcp__slack__") for tool in kwargs["allowed_tools"])
+        # slack_list_channels alone must never count as "done" -- only the
+        # actual post does.
+        assert kwargs["required_tools"] == ["mcp__slack__slack_post_message"]
 
     async def test_execute_never_reaches_stripe_regardless_of_recommendation(self):
         """Capturing/cancelling the held PaymentIntent is a deterministic
@@ -149,6 +152,9 @@ class TestClaudeActionAgentScoping:
             _, kwargs = mock_run.call_args
             assert set(kwargs["mcp_servers"].keys()) == {"slack", "github"}
             assert not any("stripe" in tool for tool in kwargs["allowed_tools"])
+            # Both actions must actually fire -- a Slack-only completion
+            # must never be recorded as "fully executed".
+            assert set(kwargs["required_tools"]) == {"mcp__slack__slack_post_message", "mcp__github__create_issue"}
 
     async def test_action_result_fields_are_code_generated_not_agent_generated(self):
         """timestamp/executed_by shouldn't depend on the LLM producing a

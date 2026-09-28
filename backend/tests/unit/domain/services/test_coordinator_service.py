@@ -199,6 +199,38 @@ class TestCoordinatorServiceHandleSignal:
         events = logged_events(mocks["case_events_repo"])
         assert any(e.event_type == CaseEventType.ROUTE_RECOMMENDATION_MISMATCH.value for e in events)
 
+    async def test_notify_failure_logs_an_error_event_before_raising(self):
+        """The case is already fully persisted by the time notify() runs --
+        a failed notification must still leave a record on the case's own
+        audit trail, not just surface via the re-raised CoordinatorError to
+        whatever called handle_signal()."""
+        coordinator, mocks = make_coordinator()
+        mocks["triage_agent"].run.return_value = make_triage(pattern="card_testing", confidence=0.9)
+        mocks["research_agent"].run.return_value = ResearchBrief(
+            signal_id="sig_1", matched_rules=[], similar_cases=[], evidence=[]
+        )
+        mocks["synthesis_agent"].run.return_value = CaseRecommendation(
+            signal_id="sig_1", risk_score=0.9, recommended_action="block",
+            draft_note="note", requires_human_approval=True,
+        )
+        returned_case = make_returned_case(status=CaseStatus.AUTO_ESCALATED, recommended_action="block")
+        mocks["cases_repo"].create.return_value = returned_case
+        mocks["action_agent"].notify.side_effect = RuntimeError("missing_scope")
+
+        with pytest.raises(CoordinatorError) as exc_info:
+            await coordinator.handle_signal(make_signal(), source=CaseSource.LIVE_STRIPE)
+
+        assert exc_info.value.stage == "notify"
+        assert exc_info.value.case_id == returned_case.case_id
+        events = logged_events(mocks["case_events_repo"])
+        error_events = [e for e in events if e.event_type == CaseEventType.ERROR.value]
+        assert len(error_events) == 1
+        assert error_events[0].case_id == returned_case.case_id
+        assert error_events[0].event_payload["stage"] == "notify"
+        assert "missing_scope" in error_events[0].event_payload["error"]
+        # NOTIFIED must never be logged for a notify() call that raised.
+        assert not any(e.event_type == CaseEventType.NOTIFIED.value for e in events)
+
     async def test_triage_failure_raises_coordinator_error_after_logging_signal(self):
         coordinator, mocks = make_coordinator()
         mocks["triage_agent"].run.side_effect = RuntimeError("boom")
@@ -207,5 +239,63 @@ class TestCoordinatorServiceHandleSignal:
             await coordinator.handle_signal(make_signal(), source=CaseSource.EVAL)
 
         assert exc_info.value.stage == "triage"
+        assert exc_info.value.case_id is None
         mocks["signals_log_repo"].log.assert_awaited_once()
         mocks["cases_repo"].create.assert_not_called()
+
+    async def test_signal_log_failure_raises_coordinator_error_not_a_raw_exception(self):
+        """Previously fully unguarded -- a failure here would propagate as
+        whatever raw exception type the repository raised, which
+        CheckoutService's `except CoordinatorError` can't catch, leaking a
+        500 after Stripe has already authorized the card."""
+        coordinator, mocks = make_coordinator()
+        mocks["signals_log_repo"].log.side_effect = RuntimeError("db unreachable")
+
+        with pytest.raises(CoordinatorError) as exc_info:
+            await coordinator.handle_signal(make_signal(), source=CaseSource.EVAL)
+
+        assert exc_info.value.stage == "signal_log"
+        assert exc_info.value.case_id is None
+        mocks["triage_agent"].run.assert_not_called()
+
+    async def test_persist_failure_raises_coordinator_error_with_no_case_id(self):
+        """cases_repo.create() failing means no case exists at all -- the
+        caller (CheckoutService) needs case_id=None here specifically to
+        know it's safe to cancel the dangling authorization."""
+        coordinator, mocks = make_coordinator()
+        mocks["triage_agent"].run.return_value = make_triage(pattern="benign", confidence=0.1)
+        mocks["cases_repo"].create.side_effect = RuntimeError("db unreachable")
+
+        with pytest.raises(CoordinatorError) as exc_info:
+            await coordinator.handle_signal(make_signal(), source=CaseSource.EVAL)
+
+        assert exc_info.value.stage == "persist"
+        assert exc_info.value.case_id is None
+
+    async def test_handoff_signal_id_mismatch_logs_a_warning_but_still_persists_the_case(self):
+        """A confused/hallucinating model response is a real signal worth
+        keeping, but hard-failing the whole pipeline over it would throw
+        away otherwise-good triage/research/synthesis work for what is, at
+        worst, an audit-trail data-integrity problem -- the persisted Case
+        always uses the original signal_id for its own identity regardless."""
+        coordinator, mocks = make_coordinator()
+        mocks["triage_agent"].run.return_value = make_triage(pattern="merchant_fraud", confidence=0.6)
+        mocks["research_agent"].run.return_value = ResearchBrief(
+            signal_id="sig_WRONG", matched_rules=[], similar_cases=[], evidence=[]
+        )
+        mocks["synthesis_agent"].run.return_value = CaseRecommendation(
+            signal_id="sig_1", risk_score=0.6, recommended_action="flag_for_review",
+            draft_note="note", requires_human_approval=False,
+        )
+        returned_case = make_returned_case(status=CaseStatus.PENDING_REVIEW)
+        mocks["cases_repo"].create.return_value = returned_case
+
+        case = await coordinator.handle_signal(make_signal(), source=CaseSource.EVAL)
+
+        assert case == returned_case
+        events = logged_events(mocks["case_events_repo"])
+        warning_events = [e for e in events if e.event_type == CaseEventType.HANDOFF_VALIDATION_WARNING.value]
+        assert len(warning_events) == 1
+        warnings = warning_events[0].event_payload["warnings"]
+        assert any("ResearchBrief.signal_id" in w for w in warnings)
+        assert any("requires_human_approval" in w for w in warnings)

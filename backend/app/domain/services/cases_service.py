@@ -1,3 +1,4 @@
+from typing import NoReturn
 from uuid import UUID
 
 from app.domain.agents import ActionAgent
@@ -14,6 +15,21 @@ class CaseNotFoundError(Exception):
 class CaseAlreadyResolvedError(Exception):
     def __init__(self, case_id: UUID, resolution: Resolution):
         super().__init__(f"Case {case_id} is already resolved ({resolution.value})")
+        self.case_id = case_id
+        self.resolution = resolution
+
+
+class CaseNotActionableError(Exception):
+    """Raised when a case's resolution is still NONE but its status isn't
+    one a human is ever meant to approve/deny -- e.g. a low-route case
+    CheckoutService already auto-closed and auto-captured on its own.
+    Without this, the case's PaymentIntent (already captured) could be
+    handed to _resolve_payment a second time."""
+
+    def __init__(self, case_id: UUID, status: CaseStatus):
+        super().__init__(f"Case {case_id} is not awaiting review (status={status.value})")
+        self.case_id = case_id
+        self.status = status
 
 
 def _should_cancel(case: Case, *, approved: bool) -> bool:
@@ -50,13 +66,18 @@ class CasesService:
     async def list_pending(self) -> list[Case]:
         return await self._cases_repo.list_pending()
 
-    async def _get_unresolved(self, case_id: UUID) -> Case:
+    async def _diagnose_resolution_failure(self, case_id: UUID) -> NoReturn:
+        """Called only after CasesRepository.update_resolution() has already
+        returned None for this case_id -- classifies why, for the right
+        HTTP status, without ever gating the write on this read (that would
+        reintroduce the check-then-act race the atomic update exists to
+        avoid)."""
         case = await self._cases_repo.get(case_id)
         if case is None:
             raise CaseNotFoundError(case_id)
         if case.resolution != Resolution.NONE:
             raise CaseAlreadyResolvedError(case_id, case.resolution)
-        return case
+        raise CaseNotActionableError(case_id, case.status)
 
     async def _resolve_payment(self, case: Case, *, approved: bool) -> None:
         # Synthetic/eval/bulk cases never have a real PaymentIntent attached.
@@ -77,41 +98,59 @@ class CasesService:
         )
 
     async def approve(self, case_id: UUID, approved_by: str) -> Case:
-        case = await self._get_unresolved(case_id)
-
-        await self._resolve_payment(case, approved=True)
-        action_result = await self._action_agent.execute(case, approved_by)
-
+        # Claim first: an atomic, conditional UPDATE (resolution=none AND a
+        # reviewable status) is both the concurrency guard -- two concurrent
+        # approve()/deny() calls for the same case can never both win -- and
+        # what makes a retry safe: once claimed, a second call for the same
+        # case_id fails fast here with CaseAlreadyResolvedError, before ever
+        # reaching _resolve_payment again. Only the winner proceeds to
+        # payment and action side effects.
         updated = await self._cases_repo.update_resolution(
-            case_id,
-            resolution=Resolution.APPROVED,
-            status=CaseStatus.CLOSED,
-            approved_by=approved_by,
+            case_id, resolution=Resolution.APPROVED, status=CaseStatus.CLOSED, approved_by=approved_by
         )
+        if updated is None:
+            await self._diagnose_resolution_failure(case_id)
+
         await self._case_events_repo.log(
             CaseEvent(case_id=case_id, event_type=CaseEventType.APPROVED.value, event_payload={"approved_by": approved_by})
         )
-        await self._case_events_repo.log(
-            CaseEvent(
-                case_id=case_id,
-                event_type=CaseEventType.ACTION_EXECUTED.value,
-                event_payload=action_result.model_dump(mode="json"),
+
+        # Payment is the part that must succeed -- real money -- and the
+        # case's own resolution is already durable at this point. Slack/
+        # GitHub notification is best-effort audit trail on top of that.
+        await self._resolve_payment(updated, approved=True)
+
+        try:
+            action_result = await self._action_agent.execute(updated, approved_by)
+            await self._case_events_repo.log(
+                CaseEvent(
+                    case_id=case_id,
+                    event_type=CaseEventType.ACTION_EXECUTED.value,
+                    event_payload=action_result.model_dump(mode="json"),
+                )
             )
-        )
+        except Exception as exc:  # noqa: BLE001 -- ActionAgent is a Protocol; record whatever it raises
+            await self._case_events_repo.log(
+                CaseEvent(
+                    case_id=case_id,
+                    event_type=CaseEventType.ERROR.value,
+                    event_payload={"stage": "execute", "error": str(exc)},
+                )
+            )
+
         return updated
 
     async def deny(self, case_id: UUID, denied_by: str) -> Case:
-        case = await self._get_unresolved(case_id)
-
-        await self._resolve_payment(case, approved=False)
-
         updated = await self._cases_repo.update_resolution(
-            case_id,
-            resolution=Resolution.DENIED,
-            status=CaseStatus.CLOSED,
-            approved_by=None,
+            case_id, resolution=Resolution.DENIED, status=CaseStatus.CLOSED, approved_by=None
         )
+        if updated is None:
+            await self._diagnose_resolution_failure(case_id)
+
         await self._case_events_repo.log(
             CaseEvent(case_id=case_id, event_type=CaseEventType.DENIED.value, event_payload={"denied_by": denied_by})
         )
+
+        await self._resolve_payment(updated, approved=False)
+
         return updated

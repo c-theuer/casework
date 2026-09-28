@@ -141,16 +141,29 @@ class CheckoutService:
         except CoordinatorError as exc:
             # The auth path is independent of the investigation queue: the
             # authorization already succeeded, so we still report that
-            # success even if triage/research/synthesis blew up downstream.
-            # The PaymentIntent is left held (requires_capture) rather than
-            # captured or cancelled here -- with no persisted case, there's
-            # nothing for a human to approve/deny to resolve it, a gap
-            # worth a real retry/reconciliation queue in production rather
-            # than guessing at a resolution from here.
+            # success even if the pipeline blew up downstream.
+            if exc.case_id is None:
+                # No case was ever created -- there's no human-review path
+                # this authorization could ever reach, so don't leave it
+                # dangling in requires_capture limbo until Stripe's own
+                # 7-day auto-cancellation. If a case *does* exist (exc.case_id
+                # set), it's queued/escalated normally and the analyst's
+                # approve/deny is the correct way to resolve its payment --
+                # cancelling behind its back here would be wrong.
+                try:
+                    await self._payment_gateway.cancel(payment_intent_id)
+                    pipeline_error = f"{exc} (no case was created; the authorization was cancelled)"
+                except Exception as cancel_exc:  # noqa: BLE001 -- PaymentGateway is a Protocol; report whatever it raises
+                    pipeline_error = (
+                        f"{exc} (no case was created, AND cancelling the dangling authorization also "
+                        f"failed: {cancel_exc} -- payment_intent_id {payment_intent_id} needs manual review)"
+                    )
+            else:
+                pipeline_error = str(exc)
             return CheckoutResult(
                 risk_level=risk_level,
                 payment_intent_id=payment_intent_id,
-                pipeline_error=str(exc),
+                pipeline_error=pipeline_error,
             )
 
         if case.route == Route.LOW:

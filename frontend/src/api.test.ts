@@ -38,7 +38,7 @@ describe("api.checkout", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe("http://localhost:8000/checkout");
+    expect(url).toBe("http://localhost:8000/v1/checkout");
     expect(init.method).toBe("POST");
     expect(init.headers).toEqual({ "Content-Type": "application/json" });
     expect(JSON.parse(init.body)).toEqual({
@@ -80,7 +80,7 @@ describe("api.listPendingCases", () => {
     await api.listPendingCases();
 
     const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe("http://localhost:8000/cases?status=pending_review");
+    expect(url).toBe("http://localhost:8000/v1/cases?status=pending_review");
     expect(init.method).toBeUndefined();
   });
 });
@@ -92,7 +92,7 @@ describe("api.approveCase", () => {
     await api.approveCase("c1", "analyst_demo");
 
     const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe("http://localhost:8000/cases/c1/approve");
+    expect(url).toBe("http://localhost:8000/v1/cases/c1/approve");
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body)).toEqual({ approved_by: "analyst_demo" });
   });
@@ -105,7 +105,7 @@ describe("api.denyCase", () => {
     await api.denyCase("c1", "analyst_demo");
 
     const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe("http://localhost:8000/cases/c1/deny");
+    expect(url).toBe("http://localhost:8000/v1/cases/c1/deny");
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body)).toEqual({ denied_by: "analyst_demo" });
   });

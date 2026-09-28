@@ -4,8 +4,20 @@ from uuid import uuid4
 
 import pytest
 
-from app.domain.entities import ActionResult, Case, CaseSource, CaseStatus, Resolution
-from app.domain.services import CaseAlreadyResolvedError, CaseNotFoundError, CasesService
+from app.domain.entities import (
+    ActionResult,
+    Case,
+    CaseEventType,
+    CaseSource,
+    CaseStatus,
+    Resolution,
+)
+from app.domain.services import (
+    CaseAlreadyResolvedError,
+    CaseNotActionableError,
+    CaseNotFoundError,
+    CasesService,
+)
 from app.infrastructure.payments.stub_gateway import StubPaymentGateway
 
 
@@ -53,7 +65,9 @@ class TestCasesService:
     async def test_approve_executes_action_and_persists_resolution(self):
         service, cases_repo, _case_events_repo, action_agent, _payment_gateway = make_service()
         case_id = uuid4()
-        cases_repo.get.return_value = make_case_dto(case_id=case_id)
+        # update_resolution() is now the atomic claim itself -- its return
+        # value IS the check that the case existed and was claimable, so
+        # there's no separate cases_repo.get() call to stub in the happy path.
         cases_repo.update_resolution.return_value = make_case_dto(
             case_id=case_id, status=CaseStatus.CLOSED, resolution=Resolution.APPROVED, approved_by="analyst_1"
         )
@@ -75,7 +89,6 @@ class TestCasesService:
     async def test_deny_does_not_call_action_agent(self):
         service, cases_repo, _case_events_repo, action_agent, _payment_gateway = make_service()
         case_id = uuid4()
-        cases_repo.get.return_value = make_case_dto(case_id=case_id)
         cases_repo.update_resolution.return_value = make_case_dto(
             case_id=case_id, status=CaseStatus.CLOSED, resolution=Resolution.DENIED
         )
@@ -89,6 +102,7 @@ class TestCasesService:
 
     async def test_approve_unknown_case_raises_not_found(self):
         service, cases_repo, *_ = make_service()
+        cases_repo.update_resolution.return_value = None
         cases_repo.get.return_value = None
 
         with pytest.raises(CaseNotFoundError):
@@ -96,9 +110,23 @@ class TestCasesService:
 
     async def test_approve_already_resolved_case_raises(self):
         service, cases_repo, *_ = make_service()
+        cases_repo.update_resolution.return_value = None
         cases_repo.get.return_value = make_case_dto(resolution=Resolution.APPROVED)
 
         with pytest.raises(CaseAlreadyResolvedError):
+            await service.approve(uuid4(), "analyst_1")
+
+    async def test_approve_closed_low_route_case_raises_not_actionable(self):
+        """A low-route case is created with status=closed, resolution=none
+        (auto-captured by CheckoutService, never reviewed by a human) -- the
+        atomic update's status condition must reject it too, not just an
+        already-resolved one, or its already-captured PaymentIntent could be
+        handed to _resolve_payment a second time."""
+        service, cases_repo, *_ = make_service()
+        cases_repo.update_resolution.return_value = None
+        cases_repo.get.return_value = make_case_dto(status=CaseStatus.CLOSED, resolution=Resolution.NONE)
+
+        with pytest.raises(CaseNotActionableError):
             await service.approve(uuid4(), "analyst_1")
 
     async def test_list_pending_delegates_to_repository(self):
@@ -117,7 +145,6 @@ class TestCasesService:
         service, cases_repo, _case_events_repo, action_agent, payment_gateway = make_service()
         case_id = uuid4()
         case = make_case_dto(case_id=case_id, recommended_action="block", stripe_payment_intent_id="pi_1")
-        cases_repo.get.return_value = case
         cases_repo.update_resolution.return_value = case
         action_agent.execute.return_value = ActionResult(
             signal_id="sig_1", action_taken="x", executed_by="a", approved_by="analyst_1",
@@ -133,7 +160,6 @@ class TestCasesService:
         service, cases_repo, _case_events_repo, action_agent, payment_gateway = make_service()
         case_id = uuid4()
         case = make_case_dto(case_id=case_id, recommended_action="flag_for_review", stripe_payment_intent_id="pi_1")
-        cases_repo.get.return_value = case
         cases_repo.update_resolution.return_value = case
         action_agent.execute.return_value = ActionResult(
             signal_id="sig_1", action_taken="x", executed_by="a", approved_by="analyst_1",
@@ -153,7 +179,6 @@ class TestCasesService:
         service, cases_repo, _case_events_repo, _action_agent, payment_gateway = make_service()
         case_id = uuid4()
         case = make_case_dto(case_id=case_id, recommended_action="block", stripe_payment_intent_id="pi_1")
-        cases_repo.get.return_value = case
         cases_repo.update_resolution.return_value = case
 
         await service.deny(case_id, "analyst_1")
@@ -165,7 +190,6 @@ class TestCasesService:
         service, cases_repo, _case_events_repo, _action_agent, payment_gateway = make_service()
         case_id = uuid4()
         case = make_case_dto(case_id=case_id, recommended_action="clear", stripe_payment_intent_id="pi_1")
-        cases_repo.get.return_value = case
         cases_repo.update_resolution.return_value = case
 
         await service.deny(case_id, "analyst_1")
@@ -173,12 +197,41 @@ class TestCasesService:
         assert payment_gateway.cancelled == ["pi_1"]
         assert payment_gateway.captured == []
 
+    async def test_approve_still_resolves_the_case_when_execute_raises(self):
+        """The payment and the case resolution are the parts that must
+        succeed; Slack/GitHub notification is best-effort on top. If
+        execute() raises (e.g. AgentActionError from a Slack permission
+        failure), approve() must still resolve the case and payment --
+        never leave it stuck unresolved with the payment already moved."""
+        service, cases_repo, case_events_repo, action_agent, payment_gateway = make_service()
+        case_id = uuid4()
+        resolved_case = make_case_dto(
+            case_id=case_id,
+            status=CaseStatus.CLOSED,
+            resolution=Resolution.APPROVED,
+            approved_by="analyst_1",
+            recommended_action="block",
+            stripe_payment_intent_id="pi_1",
+        )
+        cases_repo.update_resolution.return_value = resolved_case
+        action_agent.execute.side_effect = RuntimeError("did not confirm success: missing_scope")
+
+        result = await service.approve(case_id, "analyst_1")
+
+        assert result == resolved_case
+        assert payment_gateway.cancelled == ["pi_1"]
+        cases_repo.update_resolution.assert_awaited_once_with(
+            case_id, resolution=Resolution.APPROVED, status=CaseStatus.CLOSED, approved_by="analyst_1"
+        )
+        logged_types = [call.args[0].event_type for call in case_events_repo.log.call_args_list]
+        assert CaseEventType.ERROR.value in logged_types
+        assert CaseEventType.ACTION_EXECUTED.value not in logged_types
+
     async def test_approve_without_a_real_payment_intent_never_touches_the_gateway(self):
         """Synthetic/eval cases have no real PaymentIntent attached."""
         service, cases_repo, _case_events_repo, action_agent, payment_gateway = make_service()
         case_id = uuid4()
         case = make_case_dto(case_id=case_id, recommended_action="block", stripe_payment_intent_id=None)
-        cases_repo.get.return_value = case
         cases_repo.update_resolution.return_value = case
         action_agent.execute.return_value = ActionResult(
             signal_id="sig_1", action_taken="x", executed_by="a", approved_by="analyst_1",
