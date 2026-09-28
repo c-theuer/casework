@@ -182,7 +182,12 @@ async def main():
             cases_repo, SqlAlchemyCaseEventsRepository(session), SqlAlchemySignalsLogRepository(session),
             ClaudeTriageAgent(), ClaudeResearchAgent(get_settings()), ClaudeSynthesisAgent(), StubActionAgent(),
         )
-        checkout = CheckoutService(coordinator, StripePaymentGateway(get_settings()), source=CaseSource.INTEGRATION_TEST)
+        checkout = CheckoutService(
+            coordinator,
+            cases_repo,
+            StripePaymentGateway(get_settings()),
+            source=CaseSource.INTEGRATION_TEST,
+        )
         result = await checkout.checkout(
             account_id='acct_verify', amount=42.50, merchant_id='merch_verify',
             device_context='new_device', geo_context='new_or_foreign_location',

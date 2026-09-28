@@ -374,3 +374,19 @@ class TestCasesService:
 
         assert result.status == CaseStatus.CLOSED
         assert payment_gateway.cancelled == []
+
+    async def test_retrying_an_errored_approval_by_a_different_analyst_raises_conflict(self):
+        service, cases_repo, _case_events_repo, _action_agent, _payment_gateway = make_service()
+        case_id = uuid4()
+        cases_repo.update_resolution.return_value = None
+        cases_repo.get.return_value = make_case_dto(
+            case_id=case_id,
+            status=CaseStatus.ERROR,
+            resolution=Resolution.APPROVED,
+            approved_by="analyst_1",
+            recommended_action="block",
+            stripe_payment_intent_id="pi_1",
+        )
+
+        with pytest.raises(CaseAlreadyResolvedError):
+            await service.approve(case_id, "analyst_2")

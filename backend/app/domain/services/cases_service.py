@@ -100,6 +100,8 @@ class CasesService:
         if case is None:
             raise CaseNotFoundError(case_id)
         if case.status == CaseStatus.ERROR and case.resolution == resolution:
+            if resolution == Resolution.APPROVED and case.approved_by != approved_by:
+                raise CaseAlreadyResolvedError(case_id, case.resolution)
             return case
         if case.resolution != Resolution.NONE:
             raise CaseAlreadyResolvedError(case_id, case.resolution)
