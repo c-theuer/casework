@@ -5,7 +5,7 @@ import pytest
 class TestCheckoutEndpoint:
     async def test_elevated_card_creates_a_pending_review_case(self, client):
         response = await client.post(
-            "/checkout",
+            "/v1/checkout",
             json={
                 "account_id": "acct_it_1",
                 "amount": 42.5,
@@ -26,7 +26,7 @@ class TestCheckoutEndpoint:
 
     async def test_highest_not_blocked_card_auto_escalates(self, client):
         response = await client.post(
-            "/checkout",
+            "/v1/checkout",
             json={
                 "account_id": "acct_it_2",
                 "amount": 999.0,
@@ -43,7 +43,7 @@ class TestCheckoutEndpoint:
 
     async def test_always_blocked_card_never_creates_a_signal(self, client):
         response = await client.post(
-            "/checkout",
+            "/v1/checkout",
             json={
                 "account_id": "acct_it_3",
                 "amount": 5.0,
@@ -62,7 +62,7 @@ class TestCheckoutEndpoint:
 
     async def test_invalid_amount_is_rejected_with_422(self, client):
         response = await client.post(
-            "/checkout",
+            "/v1/checkout",
             json={
                 "account_id": "acct_it_4",
                 "amount": -5,

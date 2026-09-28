@@ -36,28 +36,63 @@ class AgentOutputError(Exception):
         self.original = original
 
 
+STATUS_SUCCESS = "STATUS: SUCCESS"
+STATUS_FAILED = "STATUS: FAILED"
+
+
 class AgentActionError(Exception):
-    """Raised when a freeform (tool-side-effect) agent call either never
-    invoked any tool at all, or a tool call it made came back as an error.
+    """Raised when a freeform (tool-side-effect) agent call didn't actually
+    complete: it never invoked any tool at all, a tool call itself came back
+    as an MCP-level error, a required tool was never called even though
+    some *other* tool was, or the agent's own final status line says
+    STATUS: FAILED (or omits the marker entirely).
 
-    This exists because a model will confidently narrate a successful
-    action in its final text even when the underlying tool call never
-    happened or failed outright (verified this the hard way: the Slack MCP
-    server failed to start, no tool was ever called, and the model still
-    replied "Message posted to #fraud-ops" as if it had). Text output alone
-    is not evidence an action occurred -- only a non-error ToolResultBlock
-    is."""
+    The status-line case is doing real work here, not just belt-and-
+    suspenders: a tool can be called and return a completely well-formed
+    MCP result that is nonetheless a failure at the *application* level --
+    e.g. Slack's API answering a `slack_list_channels` call with a normal
+    (non-error) response body of `{"ok": false, "error": "missing_scope"}`.
+    Verified this the hard way too: the model correctly read that response,
+    correctly declined to guess a channel ID, and correctly explained the
+    blocker in its text -- but because a tool call *had* happened with no
+    MCP-level error, nothing here would previously have caught that this
+    was still a failure, and the caller (CoordinatorService) went on to log
+    a NOTIFIED case event for a message that was never sent. Requiring an
+    explicit, checkable STATUS: SUCCESS line -- never inferred from prose --
+    closes that gap without having to parse Slack- or GitHub-specific error
+    shapes in generic agent infrastructure.
 
-    def __init__(self, agent_name: str, text: str, tool_calls: list[str], tool_errors: list[str]):
+    The missing-required-tool case closes a related but distinct gap: an
+    agent whose job is two actions (e.g. post to Slack AND file a GitHub
+    issue) could previously satisfy "at least one tool call happened" by
+    doing only the first and then simply asserting STATUS: SUCCESS -- the
+    model's self-report was the only thing standing between "did some of
+    the job" and "recorded as fully executed". `required_tools` is checked
+    against the actual tool-call trace, independent of anything the model
+    says about itself."""
+
+    def __init__(
+        self,
+        agent_name: str,
+        text: str,
+        tool_calls: list[str],
+        tool_errors: list[str],
+        missing_tools: list[str] | None = None,
+    ):
         if not tool_calls:
             message = f"{agent_name} claimed to act but never called any tool"
-        else:
+        elif tool_errors:
             message = f"{agent_name}'s tool call(s) failed: {tool_errors}"
+        elif missing_tools:
+            message = f"{agent_name} never called required tool(s) {missing_tools} (called: {tool_calls})"
+        else:
+            message = f"{agent_name} did not confirm success: {text[:500]}"
         super().__init__(message)
         self.agent_name = agent_name
         self.text = text
         self.tool_calls = tool_calls
         self.tool_errors = tool_errors
+        self.missing_tools = missing_tools or []
 
 
 def _extract_json(text: str) -> dict:
@@ -73,6 +108,26 @@ def _extract_json(text: str) -> dict:
         raise json.JSONDecodeError("no JSON object found in response", text, 0)
     obj, _ = json.JSONDecoder().raw_decode(text, start)
     return dict(obj)
+
+
+def _tool_result_indicates_failure(content: object) -> bool:
+    if isinstance(content, str):
+        stripped = content.strip()
+        if not stripped:
+            return False
+        try:
+            content = json.loads(stripped)
+        except json.JSONDecodeError:
+            return False
+    if isinstance(content, list):
+        return any(_tool_result_indicates_failure(item) for item in content)
+    if isinstance(content, dict):
+        if content.get("ok") is False or content.get("success") is False:
+            return True
+        status = content.get("status")
+        if isinstance(status, str) and status.lower() in {"error", "failed", "failure"}:
+            return True
+    return False
 
 
 @dataclass
@@ -122,7 +177,9 @@ async def _run_once(
                     tool_calls.append(block.name)
         elif isinstance(message, UserMessage) and isinstance(message.content, list):
             for block in message.content:
-                if isinstance(block, ToolResultBlock) and block.is_error:
+                if isinstance(block, ToolResultBlock) and (
+                    block.is_error or _tool_result_indicates_failure(block.content)
+                ):
                     tool_errors.append(str(block.content))
     return _SessionResult(text="".join(text_parts), tool_calls=tool_calls, tool_errors=tool_errors)
 
@@ -134,13 +191,26 @@ async def run_agent_freeform(
     prompt: str,
     mcp_servers: dict[str, McpServerConfig] | None = None,
     allowed_tools: list[str] | None = None,
+    required_tools: list[str] | None = None,
     model: str | None = None,
 ) -> str:
     """For agents whose real job is a tool side-effect (posting to Slack,
-    filing a GitHub issue, refunding a charge) rather than producing
-    structured data. Raises AgentActionError if no tool was actually called
-    or a tool call errored -- the model's final text is never trusted as
-    proof an action happened, only a successful ToolResultBlock is."""
+    filing a GitHub issue) rather than producing structured data. The
+    caller's system_prompt MUST require the response to end with exactly
+    one line reading "STATUS: SUCCESS" if -- and only if -- the required
+    tool action(s) actually completed, or "STATUS: FAILED" otherwise.
+    `required_tools` names every tool that must appear in the actual
+    tool-call trace for the job to count as done (e.g. execute() requires
+    both the Slack-post and the GitHub-issue tools) -- checked independently
+    of anything the model claims about itself.
+
+    Raises AgentActionError if no tool was actually called, a tool call
+    came back as an MCP-level error, a name in `required_tools` never
+    appears in the trace, or the response's own status line is STATUS:
+    FAILED or missing -- the model's prose is never trusted as proof an
+    action happened; only the actual tool-call trace *and* an explicit
+    checkable success marker are. On success, returns the response text
+    with that status line stripped off."""
     result = await _run_once(
         system_prompt=system_prompt,
         prompt=prompt,
@@ -150,7 +220,19 @@ async def run_agent_freeform(
     )
     if not result.tool_calls or result.tool_errors:
         raise AgentActionError(agent_name, result.text, result.tool_calls, result.tool_errors)
-    return result.text
+
+    missing_tools = [t for t in (required_tools or []) if t not in result.tool_calls]
+    if missing_tools:
+        raise AgentActionError(
+            agent_name, result.text, result.tool_calls, result.tool_errors, missing_tools=missing_tools
+        )
+
+    text = result.text.strip()
+    lines = text.splitlines()
+    last_line = lines[-1].strip() if lines else ""
+    if last_line != STATUS_SUCCESS:
+        raise AgentActionError(agent_name, text, result.tool_calls, result.tool_errors)
+    return "\n".join(lines[:-1]).strip()
 
 
 async def run_agent[ModelT: BaseModel](

@@ -6,7 +6,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.api.dependencies import get_cases_service
 from app.api.schemas import ApproveRequest, DenyRequest
 from app.domain.entities import Case
-from app.domain.services import CaseAlreadyResolvedError, CaseNotFoundError, CasesService
+from app.domain.services import (
+    CaseAlreadyResolvedError,
+    CaseNotActionableError,
+    CaseNotFoundError,
+    CasesService,
+)
 
 router = APIRouter(prefix="/cases", tags=["cases"])
 
@@ -31,7 +36,7 @@ async def approve_case(
         return await cases_service.approve(case_id, request.approved_by)
     except CaseNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except CaseAlreadyResolvedError as exc:
+    except (CaseAlreadyResolvedError, CaseNotActionableError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
@@ -45,5 +50,5 @@ async def deny_case(
         return await cases_service.deny(case_id, request.denied_by)
     except CaseNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except CaseAlreadyResolvedError as exc:
+    except (CaseAlreadyResolvedError, CaseNotActionableError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

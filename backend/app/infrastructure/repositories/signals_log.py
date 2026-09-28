@@ -1,6 +1,6 @@
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -48,3 +48,7 @@ class SqlAlchemySignalsLogRepository(SignalsLogRepository):
 
         result = await self._session.execute(stmt)
         return result.scalar_one()
+
+    async def delete_by_source(self, source: str) -> None:
+        await self._session.execute(delete(SignalLogModel).where(SignalLogModel.source == source))
+        await self._session.commit()

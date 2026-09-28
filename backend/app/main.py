@@ -27,8 +27,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(checkout_router)
-app.include_router(cases_router)
+app.include_router(checkout_router, prefix="/v1")
+app.include_router(cases_router, prefix="/v1")
 
 
 @app.get("/healthz")

@@ -1,6 +1,7 @@
 from uuid import UUID
 
 from sqlalchemy import delete, or_, select
+from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.entities import Case, CaseStatus, Resolution
@@ -37,10 +38,10 @@ class SqlAlchemyCasesRepository(CasesRepository):
     async def list_pending(self, exclude_sources: tuple[str, ...] = ("eval",)) -> list[Case]:
         """Cases still awaiting a human decision. Includes both
         `pending_review` (elevated, full pipeline) and `auto_escalated`
-        (critical, notified immediately) -- both still require one approval
-        click before anything irreversible happens, and the demo app has a
-        single queue view for both, per spec §9's "still requires one-click
-        human approval" language for the critical path.
+        (critical, notified immediately), plus `error` cases left
+        recoverable after a failed payment/capture step -- all still require
+        an explicit human decision or retry path, and the demo app has a
+        single queue view for them.
 
         Excludes `eval`-sourced cases by default (per spec §10's eval-harness
         idempotency requirement) but deliberately NOT `integration_test`:
@@ -48,7 +49,15 @@ class SqlAlchemyCasesRepository(CasesRepository):
         their own fixture rows to actually show up in the response."""
         stmt = (
             select(CaseModel)
-            .where(CaseModel.status.in_(["pending_review", "auto_escalated"]))
+            .where(
+                CaseModel.status.in_(
+                    [
+                        CaseStatus.PENDING_REVIEW.value,
+                        CaseStatus.AUTO_ESCALATED.value,
+                        CaseStatus.ERROR.value,
+                    ]
+                )
+            )
             .where(CaseModel.source.not_in(exclude_sources))
             .order_by(CaseModel.created_at.asc())
         )
@@ -57,21 +66,61 @@ class SqlAlchemyCasesRepository(CasesRepository):
 
     async def update_resolution(
         self, case_id: UUID, *, resolution: Resolution, status: CaseStatus, approved_by: str | None
-    ) -> Case:
-        row = await self._session.get(CaseModel, case_id)
-        if row is None:
-            # Callers are expected to have already confirmed the case exists
-            # (CasesService does, via get()) -- this only fires on a race
-            # (deleted between that check and this call), but the type
-            # checker is right that session.get() can return None and this
-            # must not silently AttributeError on the next line.
-            raise LookupError(f"No case with id {case_id}")
-        row.resolution = resolution.value
-        row.status = status.value
-        row.approved_by = approved_by
+    ) -> Case | None:
+        # Atomic conditional UPDATE, not a read-then-write: the WHERE clause
+        # is the concurrency guard. Under READ COMMITTED, two concurrent
+        # UPDATEs for the same case_id serialize on the row lock; the second
+        # one to run re-evaluates this WHERE clause against the first one's
+        # now-committed row, sees resolution is no longer 'none', and
+        # correctly matches zero rows -- no explicit SELECT ... FOR UPDATE
+        # needed. The status condition is what stops a low-route case
+        # (status=closed, resolution=none, already auto-captured) from being
+        # approved/denied a second time.
+        stmt = (
+            sa_update(CaseModel)
+            .where(
+                CaseModel.case_id == case_id,
+                CaseModel.resolution == Resolution.NONE.value,
+                CaseModel.status.in_(
+                    [
+                        CaseStatus.PENDING_REVIEW.value,
+                        CaseStatus.AUTO_ESCALATED.value,
+                        CaseStatus.ERROR.value,
+                    ]
+                ),
+            )
+            .values(resolution=resolution.value, status=status.value, approved_by=approved_by)
+            .returning(CaseModel)
+        )
+        result = await self._session.execute(stmt)
+        row = result.scalar_one_or_none()
         await self._session.commit()
-        await self._session.refresh(row)
-        return Case.model_validate(row, from_attributes=True)
+        return Case.model_validate(row, from_attributes=True) if row is not None else None
+
+    async def update_status(
+        self,
+        case_id: UUID,
+        *,
+        current_statuses: tuple[CaseStatus, ...],
+        new_status: CaseStatus,
+        current_resolution: Resolution | None = None,
+    ) -> Case | None:
+        conditions = [
+            CaseModel.case_id == case_id,
+            CaseModel.status.in_([status.value for status in current_statuses]),
+        ]
+        if current_resolution is not None:
+            conditions.append(CaseModel.resolution == current_resolution.value)
+        stmt = (
+            sa_update(CaseModel)
+            .where(*conditions)
+            .values(status=new_status.value)
+            .returning(CaseModel)
+        )
+        result = await self._session.execute(stmt)
+        row = result.scalar_one_or_none()
+        await self._session.commit()
+        return Case.model_validate(row, from_attributes=True) if row is not None else None
 
     async def find_similar(self, account_id: str, pattern: str | None, limit: int = 5) -> list[Case]:
         stmt = (

@@ -1,5 +1,6 @@
 from app.domain.services.cases_service import (
     CaseAlreadyResolvedError,
+    CaseNotActionableError,
     CaseNotFoundError,
     CasesService,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "TEST_CARDS",
     "AuthorizationDeclinedError",
     "CaseAlreadyResolvedError",
+    "CaseNotActionableError",
     "CaseNotFoundError",
     "CasesService",
     "CheckoutResult",

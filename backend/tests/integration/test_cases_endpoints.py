@@ -38,7 +38,7 @@ class TestCasesEndpoints:
     async def test_list_pending_returns_seeded_case(self, client, cases_repo):
         case = await cases_repo.create(make_case_dto(signal_id="sig_it_list_1"))
 
-        response = await client.get("/cases?status=pending_review")
+        response = await client.get("/v1/cases?status=pending_review")
 
         assert response.status_code == 200
         ids = [c["case_id"] for c in response.json()]
@@ -54,7 +54,7 @@ class TestCasesEndpoints:
             )
         )
 
-        response = await client.get("/cases?status=pending_review")
+        response = await client.get("/v1/cases?status=pending_review")
 
         ids = [c["case_id"] for c in response.json()]
         assert str(case.case_id) in ids
@@ -62,7 +62,7 @@ class TestCasesEndpoints:
     async def test_approve_closes_case_and_removes_it_from_queue(self, client, cases_repo):
         case = await cases_repo.create(make_case_dto(signal_id="sig_it_approve_1"))
 
-        response = await client.post(f"/cases/{case.case_id}/approve", json={"approved_by": "analyst_1"})
+        response = await client.post(f"/v1/cases/{case.case_id}/approve", json={"approved_by": "analyst_1"})
 
         assert response.status_code == 200
         body = response.json()
@@ -70,13 +70,13 @@ class TestCasesEndpoints:
         assert body["resolution"] == "approved"
         assert body["approved_by"] == "analyst_1"
 
-        queue = await client.get("/cases?status=pending_review")
+        queue = await client.get("/v1/cases?status=pending_review")
         assert str(case.case_id) not in [c["case_id"] for c in queue.json()]
 
     async def test_deny_closes_case_without_approved_by(self, client, cases_repo):
         case = await cases_repo.create(make_case_dto(signal_id="sig_it_deny_1"))
 
-        response = await client.post(f"/cases/{case.case_id}/deny", json={"denied_by": "analyst_1"})
+        response = await client.post(f"/v1/cases/{case.case_id}/deny", json={"denied_by": "analyst_1"})
 
         assert response.status_code == 200
         body = response.json()
@@ -86,15 +86,15 @@ class TestCasesEndpoints:
 
     async def test_approve_unknown_case_returns_404(self, client):
         response = await client.post(
-            "/cases/00000000-0000-0000-0000-000000000000/approve",
+            "/v1/cases/00000000-0000-0000-0000-000000000000/approve",
             json={"approved_by": "analyst_1"},
         )
         assert response.status_code == 404
 
     async def test_approve_already_resolved_case_returns_409(self, client, cases_repo):
         case = await cases_repo.create(make_case_dto(signal_id="sig_it_conflict_1"))
-        first = await client.post(f"/cases/{case.case_id}/approve", json={"approved_by": "analyst_1"})
+        first = await client.post(f"/v1/cases/{case.case_id}/approve", json={"approved_by": "analyst_1"})
         assert first.status_code == 200
 
-        second = await client.post(f"/cases/{case.case_id}/approve", json={"approved_by": "analyst_2"})
+        second = await client.post(f"/v1/cases/{case.case_id}/approve", json={"approved_by": "analyst_2"})
         assert second.status_code == 409

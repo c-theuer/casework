@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.api.dependencies import (
     get_action_agent,
+    get_cases_repository,
     get_checkout_service,
     get_coordinator_service,
     get_db_session,
@@ -19,6 +20,7 @@ from app.api.dependencies import (
 )
 from app.domain.entities import CaseSource
 from app.domain.gateways import PaymentGateway
+from app.domain.repositories import CasesRepository
 from app.domain.services import CheckoutService, CoordinatorService
 from app.infrastructure.agents import (
     StubActionAgent,
@@ -31,6 +33,7 @@ from app.infrastructure.payments.stub_gateway import StubPaymentGateway
 from app.infrastructure.repositories import (
     SqlAlchemyCaseEventsRepository,
     SqlAlchemyCasesRepository,
+    SqlAlchemySignalsLogRepository,
 )
 from app.main import app
 
@@ -69,14 +72,20 @@ async def case_events_repo(test_session):
     return SqlAlchemyCaseEventsRepository(test_session)
 
 
+@pytest_asyncio.fixture
+async def signals_log_repo(test_session):
+    return SqlAlchemySignalsLogRepository(test_session)
+
+
 def _checkout_service_tagged_for_tests(
     coordinator: CoordinatorService = Depends(get_coordinator_service),
+    cases_repo: CasesRepository = Depends(get_cases_repository),
     payment_gateway: PaymentGateway = Depends(get_payment_gateway),
 ) -> CheckoutService:
     # Tagging cases as `integration_test` (instead of the real `live_stripe`
     # a production checkout would use) is what lets the teardown below clean
     # up safely without ever touching rows a manual local dev session made.
-    return CheckoutService(coordinator, payment_gateway, source=CaseSource.INTEGRATION_TEST)
+    return CheckoutService(coordinator, cases_repo, payment_gateway, source=CaseSource.INTEGRATION_TEST)
 
 
 @pytest_asyncio.fixture

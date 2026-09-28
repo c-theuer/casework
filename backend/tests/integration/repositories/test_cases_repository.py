@@ -91,6 +91,13 @@ class TestCasesRepository:
         assert elevated.case_id in ids
         assert critical.case_id in ids
 
+    async def test_list_pending_includes_error_cases(self, cases_repo):
+        errored = await cases_repo.create(make_case_dto(status=CaseStatus.ERROR))
+
+        ids = [c.case_id for c in await cases_repo.list_pending()]
+
+        assert errored.case_id in ids
+
     async def test_list_pending_excludes_closed_cases(self, cases_repo):
         closed = await cases_repo.create(make_case_dto(status=CaseStatus.CLOSED))
 
@@ -114,6 +121,56 @@ class TestCasesRepository:
 
         refetched = await cases_repo.get(case.case_id)
         assert refetched.status == CaseStatus.CLOSED
+
+    async def test_update_resolution_returns_none_on_a_second_call_for_the_same_case(self, cases_repo):
+        """Proves the atomic-claim contract against real Postgres, not just
+        a mock: the WHERE clause (resolution='none' AND a reviewable status)
+        means a case can only ever be claimed once -- this is the actual
+        concurrency guard, not a UNIQUE constraint or an app-level lock."""
+        case = await cases_repo.create(make_case_dto())
+
+        first = await cases_repo.update_resolution(
+            case.case_id, resolution=Resolution.APPROVED, status=CaseStatus.CLOSED, approved_by="analyst_1"
+        )
+        second = await cases_repo.update_resolution(
+            case.case_id, resolution=Resolution.DENIED, status=CaseStatus.CLOSED, approved_by=None
+        )
+
+        assert first is not None
+        assert first.resolution == Resolution.APPROVED
+        assert second is None
+        # The second (rejected) call must not have overwritten the first's
+        # resolution -- confirms the WHERE clause, not just the RETURNING
+        # clause, is doing the work.
+        refetched = await cases_repo.get(case.case_id)
+        assert refetched.resolution == Resolution.APPROVED
+
+    async def test_update_resolution_returns_none_for_a_closed_low_route_case(self, cases_repo):
+        """A low-route case is created with status=closed, resolution=none
+        directly (never goes through update_resolution to get there) -- the
+        status condition must reject it too, not just resolution != none."""
+        case = await cases_repo.create(
+            make_case_dto(status=CaseStatus.CLOSED, resolution=Resolution.NONE, route=Route.LOW)
+        )
+
+        result = await cases_repo.update_resolution(
+            case.case_id, resolution=Resolution.APPROVED, status=CaseStatus.CLOSED, approved_by="analyst_1"
+        )
+
+        assert result is None
+
+    async def test_update_status_changes_only_matching_rows(self, cases_repo):
+        case = await cases_repo.create(make_case_dto(status=CaseStatus.CLOSED, resolution=Resolution.NONE))
+
+        updated = await cases_repo.update_status(
+            case.case_id,
+            current_statuses=(CaseStatus.CLOSED,),
+            new_status=CaseStatus.ERROR,
+            current_resolution=Resolution.NONE,
+        )
+
+        assert updated is not None
+        assert updated.status == CaseStatus.ERROR
 
     async def test_find_similar_matches_by_account_id_or_pattern(self, cases_repo):
         same_account = await cases_repo.create(

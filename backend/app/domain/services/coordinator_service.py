@@ -1,3 +1,6 @@
+from contextlib import suppress
+from uuid import UUID
+
 from app.domain.agents import ActionAgent, ResearchAgent, SynthesisAgent, TriageAgent
 from app.domain.entities import (
     Case,
@@ -15,16 +18,23 @@ from app.domain.repositories import CaseEventsRepository, CasesRepository, Signa
 
 
 class CoordinatorError(Exception):
-    """Raised when the pipeline fails after the signal has already been
-    logged. Callers (e.g. CheckoutService) should catch this and still return
-    whatever upstream result they already have -- the auth path is
-    independent of the investigation queue."""
+    """Raised when the pipeline fails at any stage. Callers (e.g.
+    CheckoutService) should catch this and still return whatever upstream
+    result they already have -- the auth path is independent of the
+    investigation queue.
 
-    def __init__(self, signal_id: str, stage: str, original: Exception):
+    `case_id` is None unless a Case row has actually been durably created
+    by the time the failure happened -- it's how CheckoutService decides
+    whether there's any human-review path left for a held authorization to
+    reach: no case means cancel it, a real case means leave it for the
+    analyst's approve/deny to resolve instead."""
+
+    def __init__(self, signal_id: str, stage: str, original: Exception, *, case_id: UUID | None = None):
         super().__init__(f"Coordinator pipeline failed for {signal_id} at stage '{stage}': {original}")
         self.signal_id = signal_id
         self.stage = stage
         self.original = original
+        self.case_id = case_id
 
 
 def decide_route(triage: TriageResult) -> Route:
@@ -64,6 +74,18 @@ class CoordinatorService:
         self._synthesis_agent = synthesis_agent
         self._action_agent = action_agent
 
+    async def _log_case_event(
+        self, signal_id: str, case_id: UUID, *, stage: str, event: CaseEvent
+    ) -> None:
+        try:
+            await self._case_events_repo.log(event)
+        except Exception as exc:
+            raise CoordinatorError(signal_id, stage, exc, case_id=case_id) from exc
+
+    async def _log_case_event_best_effort(self, event: CaseEvent) -> None:
+        with suppress(Exception):
+            await self._case_events_repo.log(event)
+
     async def _velocity_context(self, signal: Signal) -> dict:
         device_context = signal.payload.get("device_context")
         recent_txn_count = await self._signals_log_repo.count_recent(
@@ -77,7 +99,10 @@ class CoordinatorService:
         return result
 
     async def handle_signal(self, signal: Signal, source: CaseSource) -> Case:
-        await self._signals_log_repo.log(_signal_to_log_entry(signal, source))
+        try:
+            await self._signals_log_repo.log(_signal_to_log_entry(signal, source))
+        except Exception as exc:
+            raise CoordinatorError(signal.signal_id, "signal_log", exc) from exc
 
         try:
             velocity_context = await self._velocity_context(signal)
@@ -88,11 +113,18 @@ class CoordinatorService:
         route = decide_route(triage)
 
         if route == Route.LOW:
-            case = await self._cases_repo.create(
-                _build_case_dto(signal, triage, route, CaseStatus.CLOSED, source)
-            )
-            await self._case_events_repo.log(
-                CaseEvent(case_id=case.case_id, event_type=CaseEventType.LOGGED_ONLY.value)
+            try:
+                case = await self._cases_repo.create(
+                    _build_case_dto(signal, triage, route, CaseStatus.CLOSED, source)
+                )
+            except Exception as exc:
+                raise CoordinatorError(signal.signal_id, "persist", exc) from exc
+            assert case.case_id is not None
+            await self._log_case_event(
+                signal.signal_id,
+                case.case_id,
+                stage="logged_only",
+                event=CaseEvent(case_id=case.case_id, event_type=CaseEventType.LOGGED_ONLY.value),
             )
             return case
 
@@ -102,6 +134,32 @@ class CoordinatorService:
         except Exception as exc:
             raise CoordinatorError(signal.signal_id, "research_or_synthesis", exc) from exc
 
+        # Defensive validation of the LLM's own structured handoffs: neither
+        # is trusted just because it validated against its Pydantic schema.
+        # Soft, not a hard failure -- the persisted Case always uses
+        # signal.signal_id for its own identity (never research.signal_id/
+        # recommendation.signal_id), so a mismatch here is a real audit-trail
+        # data-integrity problem, not a wrong case being created. Throwing
+        # away otherwise-good triage/research/synthesis work over a cosmetic
+        # ID mismatch would be a worse outcome than just flagging it.
+        handoff_warnings = []
+        if research.signal_id != signal.signal_id:
+            handoff_warnings.append(
+                f"ResearchBrief.signal_id {research.signal_id!r} does not match Signal {signal.signal_id!r}"
+            )
+        if recommendation.signal_id != signal.signal_id:
+            handoff_warnings.append(
+                f"CaseRecommendation.signal_id {recommendation.signal_id!r} does not match Signal {signal.signal_id!r}"
+            )
+        if not recommendation.requires_human_approval:
+            # Never actually trusted to skip approval anywhere in this
+            # codebase (every non-LOW case requires an explicit approve/deny
+            # regardless) -- but a model claiming otherwise is worth keeping
+            # visible, not silently discarding.
+            handoff_warnings.append(
+                "CaseRecommendation.requires_human_approval was False; human approval is required regardless"
+            )
+
         recommended_action = recommendation.recommended_action
         mismatch = route == Route.CRITICAL and recommended_action != "block"
         if route == Route.CRITICAL:
@@ -109,69 +167,120 @@ class CoordinatorService:
 
         status = CaseStatus.AUTO_ESCALATED if route == Route.CRITICAL else CaseStatus.PENDING_REVIEW
 
-        case = await self._cases_repo.create(
-            _build_case_dto(
-                signal,
-                triage,
-                route,
-                status,
-                source,
-                research=research,
-                risk_score=recommendation.risk_score,
-                recommended_action=recommended_action,
-                draft_note=recommendation.draft_note,
+        try:
+            case = await self._cases_repo.create(
+                _build_case_dto(
+                    signal,
+                    triage,
+                    route,
+                    status,
+                    source,
+                    research=research,
+                    risk_score=recommendation.risk_score,
+                    recommended_action=recommended_action,
+                    draft_note=recommendation.draft_note,
+                )
             )
-        )
+        except Exception as exc:
+            raise CoordinatorError(signal.signal_id, "persist", exc) from exc
+        assert case.case_id is not None
 
-        await self._case_events_repo.log(
-            CaseEvent(
-                case_id=case.case_id, event_type=CaseEventType.TRIAGED.value, event_payload=triage.model_dump()
+        if handoff_warnings:
+            await self._log_case_event(
+                signal.signal_id,
+                case.case_id,
+                stage="handoff_validation_warning",
+                event=CaseEvent(
+                    case_id=case.case_id,
+                    event_type=CaseEventType.HANDOFF_VALIDATION_WARNING.value,
+                    event_payload={"warnings": handoff_warnings},
+                ),
             )
+
+        await self._log_case_event(
+            signal.signal_id,
+            case.case_id,
+            stage="triaged",
+            event=CaseEvent(
+                case_id=case.case_id, event_type=CaseEventType.TRIAGED.value, event_payload=triage.model_dump()
+            ),
         )
-        await self._case_events_repo.log(
-            CaseEvent(
+        await self._log_case_event(
+            signal.signal_id,
+            case.case_id,
+            stage="researched",
+            event=CaseEvent(
                 case_id=case.case_id,
                 event_type=CaseEventType.RESEARCHED.value,
                 event_payload=research.model_dump(),
-            )
+            ),
         )
-        await self._case_events_repo.log(
-            CaseEvent(
+        await self._log_case_event(
+            signal.signal_id,
+            case.case_id,
+            stage="synthesized",
+            event=CaseEvent(
                 case_id=case.case_id,
                 event_type=CaseEventType.SYNTHESIZED.value,
                 event_payload=recommendation.model_dump(),
-            )
+            ),
         )
         if mismatch:
-            await self._case_events_repo.log(
-                CaseEvent(
+            await self._log_case_event(
+                signal.signal_id,
+                case.case_id,
+                stage="route_recommendation_mismatch",
+                event=CaseEvent(
                     case_id=case.case_id,
                     event_type=CaseEventType.ROUTE_RECOMMENDATION_MISMATCH.value,
                     event_payload={
                         "synthesis_recommended": recommendation.recommended_action,
                         "overridden_to": "block",
                     },
-                )
+                ),
             )
 
         if route == Route.CRITICAL:
-            await self._case_events_repo.log(
-                CaseEvent(case_id=case.case_id, event_type=CaseEventType.AUTO_ESCALATED.value)
+            await self._log_case_event(
+                signal.signal_id,
+                case.case_id,
+                stage="auto_escalated",
+                event=CaseEvent(case_id=case.case_id, event_type=CaseEventType.AUTO_ESCALATED.value),
             )
             try:
                 action_result = await self._action_agent.notify(case)
-                await self._case_events_repo.log(
-                    CaseEvent(
+                await self._log_case_event(
+                    signal.signal_id,
+                    case.case_id,
+                    stage="notified",
+                    event=CaseEvent(
                         case_id=case.case_id,
                         event_type=CaseEventType.NOTIFIED.value,
                         event_payload=action_result.model_dump(mode="json"),
-                    )
+                    ),
                 )
             except Exception as exc:
-                raise CoordinatorError(signal.signal_id, "notify", exc) from exc
+                # The case itself is already fully persisted at this point --
+                # a failed notification shouldn't erase that from the case's
+                # own audit trail, only the caller's immediate response
+                # (CheckoutService surfaces the re-raised CoordinatorError as
+                # pipeline_error). Without this, an analyst opening the case
+                # later would see AUTO_ESCALATED with no explanation for why
+                # no Slack message ever arrived.
+                await self._log_case_event_best_effort(
+                    CaseEvent(
+                        case_id=case.case_id,
+                        event_type=CaseEventType.ERROR.value,
+                        event_payload={"stage": "notify", "error": str(exc)},
+                    )
+                )
+                raise CoordinatorError(signal.signal_id, "notify", exc, case_id=case.case_id) from exc
         else:
-            await self._case_events_repo.log(
-                CaseEvent(case_id=case.case_id, event_type=CaseEventType.QUEUED_FOR_REVIEW.value)
+            await self._log_case_event(
+                signal.signal_id,
+                case.case_id,
+                stage="queued_for_review",
+                event=CaseEvent(case_id=case.case_id, event_type=CaseEventType.QUEUED_FOR_REVIEW.value),
             )
 
         return case

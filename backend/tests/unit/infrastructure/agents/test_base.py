@@ -2,10 +2,18 @@ import json
 from unittest.mock import patch
 
 import pytest
-from claude_agent_sdk import AssistantMessage, TextBlock
+from claude_agent_sdk import AssistantMessage, TextBlock, ToolResultBlock, ToolUseBlock, UserMessage
 from pydantic import BaseModel
 
-from app.infrastructure.agents.base import AgentOutputError, _extract_json, run_agent
+from app.infrastructure.agents.base import (
+    STATUS_FAILED,
+    STATUS_SUCCESS,
+    AgentActionError,
+    AgentOutputError,
+    _extract_json,
+    run_agent,
+    run_agent_freeform,
+)
 
 
 class _Widget(BaseModel):
@@ -129,3 +137,158 @@ class TestRunAgent:
         assert captured_options["tools"] == []
         # Headless: never hang on an unanswered permission prompt.
         assert captured_options["permission_mode"] == "dontAsk"
+
+
+def _assistant_tool_use(*, name: str = "mcp__slack__slack_post_message", text_after: str = "") -> list:
+    """One AssistantMessage carrying a ToolUseBlock, optionally followed by
+    a second AssistantMessage with trailing text (e.g. the final summary +
+    status line the model writes after seeing the tool result)."""
+    messages = [AssistantMessage(content=[ToolUseBlock(id="tu_1", name=name, input={})], model="claude-test")]
+    if text_after:
+        messages.append(_assistant_text(text_after))
+    return messages
+
+
+def _user_tool_result(*, is_error: bool, content: str = "ok") -> UserMessage:
+    return UserMessage(
+        content=[ToolResultBlock(tool_use_id="tu_1", content=content, is_error=is_error)],
+        uuid="u_1",
+        parent_tool_use_id=None,
+        tool_use_result=None,
+    )
+
+
+@pytest.mark.asyncio
+class TestRunAgentFreeform:
+    async def test_returns_text_with_status_line_stripped_on_success(self):
+        async def _fake_query(*, prompt, options):
+            for msg in _assistant_tool_use(text_after=f"Posted the message.\n{STATUS_SUCCESS}"):
+                yield msg
+            yield _user_tool_result(is_error=False)
+
+        with patch("app.infrastructure.agents.base.query", side_effect=_fake_query):
+            result = await run_agent_freeform(
+                agent_name="TestAgent", system_prompt="be helpful", prompt="do it"
+            )
+        assert result == "Posted the message."
+
+    async def test_raises_when_no_tool_was_ever_called(self):
+        async def _fake_query(*, prompt, options):
+            yield _assistant_text(f"I posted it.\n{STATUS_SUCCESS}")
+
+        with (
+            patch("app.infrastructure.agents.base.query", side_effect=_fake_query),
+            pytest.raises(AgentActionError) as exc_info,
+        ):
+            await run_agent_freeform(agent_name="TestAgent", system_prompt="be helpful", prompt="do it")
+        assert "never called any tool" in str(exc_info.value)
+
+    async def test_raises_when_a_tool_call_comes_back_as_an_mcp_error(self):
+        async def _fake_query(*, prompt, options):
+            for msg in _assistant_tool_use(text_after=f"Done.\n{STATUS_SUCCESS}"):
+                yield msg
+            yield _user_tool_result(is_error=True, content="permission denied")
+
+        with (
+            patch("app.infrastructure.agents.base.query", side_effect=_fake_query),
+            pytest.raises(AgentActionError) as exc_info,
+        ):
+            await run_agent_freeform(agent_name="TestAgent", system_prompt="be helpful", prompt="do it")
+        assert "tool call(s) failed" in str(exc_info.value)
+
+    async def test_raises_when_model_reports_status_failed(self):
+        """Regression test: a Slack tool call can return a normal (non-error)
+        MCP result whose *content* is itself an application-level failure
+        (Slack's own {"ok": false, "error": "missing_scope"}) -- the model
+        correctly reads this and says so, but without an explicit checkable
+        marker there was nothing stopping that from being logged as a
+        success anyway."""
+
+        async def _fake_query(*, prompt, options):
+            for msg in _assistant_tool_use(
+                text_after=f"Could not post: missing_scope.\n{STATUS_FAILED}"
+            ):
+                yield msg
+            yield _user_tool_result(is_error=False, content='{"ok": true}')
+
+        with (
+            patch("app.infrastructure.agents.base.query", side_effect=_fake_query),
+            pytest.raises(AgentActionError) as exc_info,
+        ):
+            await run_agent_freeform(agent_name="TestAgent", system_prompt="be helpful", prompt="do it")
+        assert "did not confirm success" in str(exc_info.value)
+
+    async def test_raises_when_tool_payload_reports_application_level_failure(self):
+        async def _fake_query(*, prompt, options):
+            for msg in _assistant_tool_use(
+                text_after=f"Posted to Slack.\n{STATUS_SUCCESS}"
+            ):
+                yield msg
+            yield _user_tool_result(is_error=False, content='{"ok": false, "error": "missing_scope"}')
+
+        with (
+            patch("app.infrastructure.agents.base.query", side_effect=_fake_query),
+            pytest.raises(AgentActionError) as exc_info,
+        ):
+            await run_agent_freeform(agent_name="TestAgent", system_prompt="be helpful", prompt="do it")
+        assert "tool call(s) failed" in str(exc_info.value)
+
+    async def test_raises_when_status_line_is_missing_entirely(self):
+        async def _fake_query(*, prompt, options):
+            for msg in _assistant_tool_use(text_after="I think that worked."):
+                yield msg
+            yield _user_tool_result(is_error=False)
+
+        with (
+            patch("app.infrastructure.agents.base.query", side_effect=_fake_query),
+            pytest.raises(AgentActionError),
+        ):
+            await run_agent_freeform(agent_name="TestAgent", system_prompt="be helpful", prompt="do it")
+
+    async def test_raises_when_a_required_tool_never_fired_even_though_another_did(self):
+        """Regression test: an agent whose job is two actions (e.g. post to
+        Slack AND file a GitHub issue) could previously satisfy "at least
+        one tool call happened" by doing only the first, then simply
+        asserting STATUS: SUCCESS. required_tools is checked against the
+        actual trace, independent of what the model claims."""
+
+        async def _fake_query(*, prompt, options):
+            for msg in _assistant_tool_use(
+                name="mcp__slack__slack_post_message", text_after=f"Posted to Slack.\n{STATUS_SUCCESS}"
+            ):
+                yield msg
+            yield _user_tool_result(is_error=False)
+
+        with (
+            patch("app.infrastructure.agents.base.query", side_effect=_fake_query),
+            pytest.raises(AgentActionError) as exc_info,
+        ):
+            await run_agent_freeform(
+                agent_name="TestAgent",
+                system_prompt="be helpful",
+                prompt="do it",
+                required_tools=["mcp__slack__slack_post_message", "mcp__github__create_issue"],
+            )
+        assert "mcp__github__create_issue" in str(exc_info.value)
+        assert exc_info.value.missing_tools == ["mcp__github__create_issue"]
+
+    async def test_succeeds_when_all_required_tools_fired(self):
+        async def _fake_query(*, prompt, options):
+            yield AssistantMessage(
+                content=[
+                    ToolUseBlock(id="tu_1", name="mcp__slack__slack_post_message", input={}),
+                    ToolUseBlock(id="tu_2", name="mcp__github__create_issue", input={}),
+                ],
+                model="claude-test",
+            )
+            yield _user_tool_result(is_error=False)
+            yield _assistant_text(f"Done.\n{STATUS_SUCCESS}")
+
+        with patch("app.infrastructure.agents.base.query", side_effect=_fake_query):
+            result = await run_agent_freeform(
+                agent_name="TestAgent",
+                system_prompt="be helpful",
+                prompt="do it",
+                required_tools=["mcp__slack__slack_post_message", "mcp__github__create_issue"],
+            )
+        assert result == "Done."

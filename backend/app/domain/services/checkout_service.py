@@ -2,8 +2,9 @@ import uuid
 from datetime import UTC, datetime
 from typing import Literal, TypedDict
 
-from app.domain.entities import Case, CaseSource, Route, Signal
+from app.domain.entities import Case, CaseSource, CaseStatus, Resolution, Route, Signal
 from app.domain.gateways import PaymentDeclinedError, PaymentGateway
+from app.domain.repositories import CasesRepository
 from app.domain.services.coordinator_service import CoordinatorError, CoordinatorService
 
 TestCardKey = Literal["elevated", "highest_not_blocked", "highest_blocked"]
@@ -78,10 +79,12 @@ class CheckoutService:
     def __init__(
         self,
         coordinator: CoordinatorService,
+        cases_repo: CasesRepository,
         payment_gateway: PaymentGateway,
         source: CaseSource = CaseSource.LIVE_STRIPE,
     ):
         self._coordinator = coordinator
+        self._cases_repo = cases_repo
         self._payment_gateway = payment_gateway
         self._source = source
 
@@ -141,30 +144,60 @@ class CheckoutService:
         except CoordinatorError as exc:
             # The auth path is independent of the investigation queue: the
             # authorization already succeeded, so we still report that
-            # success even if triage/research/synthesis blew up downstream.
-            # The PaymentIntent is left held (requires_capture) rather than
-            # captured or cancelled here -- with no persisted case, there's
-            # nothing for a human to approve/deny to resolve it, a gap
-            # worth a real retry/reconciliation queue in production rather
-            # than guessing at a resolution from here.
+            # success even if the pipeline blew up downstream.
+            if exc.case_id is None:
+                # No case was ever created -- there's no human-review path
+                # this authorization could ever reach, so don't leave it
+                # dangling in requires_capture limbo until Stripe's own
+                # 7-day auto-cancellation. If a case *does* exist (exc.case_id
+                # set), it's queued/escalated normally and the analyst's
+                # approve/deny is the correct way to resolve its payment --
+                # cancelling behind its back here would be wrong.
+                try:
+                    await self._payment_gateway.cancel(payment_intent_id)
+                    pipeline_error = f"{exc} (no case was created; the authorization was cancelled)"
+                except Exception as cancel_exc:  # noqa: BLE001 -- PaymentGateway is a Protocol; report whatever it raises
+                    pipeline_error = (
+                        f"{exc} (no case was created, AND cancelling the dangling authorization also "
+                        f"failed: {cancel_exc} -- payment_intent_id {payment_intent_id} needs manual review)"
+                    )
+            else:
+                pipeline_error = str(exc)
             return CheckoutResult(
                 risk_level=risk_level,
                 payment_intent_id=payment_intent_id,
-                pipeline_error=str(exc),
+                pipeline_error=pipeline_error,
             )
 
         if case.route == Route.LOW:
             # Nothing ever reviews a low-risk case -- the pipeline itself
             # is the approval, so capture immediately rather than leave the
             # hold dangling until Stripe's own 7-day auto-cancellation.
+            assert case.case_id is not None
             try:
                 await self._payment_gateway.capture(payment_intent_id)
             except Exception as exc:  # noqa: BLE001 -- PaymentGateway is a Protocol; report whatever it raises
+                retry_error = ""
+                try:
+                    updated = await self._cases_repo.update_status(
+                        case.case_id,
+                        current_statuses=(CaseStatus.CLOSED,),
+                        new_status=CaseStatus.ERROR,
+                        current_resolution=Resolution.NONE,
+                    )
+                    if updated is None:
+                        retry_error = (
+                            " The case could not be moved into a recoverable retry state; manual review is required."
+                        )
+                except Exception as update_exc:  # noqa: BLE001 -- CasesRepository is a Protocol; report whatever it raises
+                    retry_error = (
+                        f" Updating the case for retry also failed: {update_exc}; manual review is required."
+                    )
                 return CheckoutResult(
                     risk_level=risk_level,
                     payment_intent_id=payment_intent_id,
                     case=case,
-                    pipeline_error=f"Case auto-cleared but capturing the authorization failed: {exc}",
+                    pipeline_error=f"Case auto-cleared but capturing the authorization failed: {exc}.{retry_error}",
                 )
 
         return CheckoutResult(risk_level=risk_level, payment_intent_id=payment_intent_id, case=case)

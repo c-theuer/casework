@@ -1,0 +1,419 @@
+# Hand-labeled eval scenarios for scripts/run_eval.py, per casework-spec.md
+# §10: 20 scenarios (card_testing 5, account_takeover 4, merchant_fraud 3,
+# mule_activity 3, friendly_fraud 3, benign 2), scored against ground truth.
+#
+# Timestamps: `occurred_minutes_ago` (main signal) and `prior_signals[].
+# minutes_ago` are both resolved by the harness against one `run_now`
+# captured fresh at startup -- never hardcode an absolute occurred_at here,
+# it would silently fall out of the 10-minute velocity window once real
+# time moves past it.
+#
+# `prior_signals` (pre-seeds signals_log directly, bypassing handle_signal,
+# to give CoordinatorService._velocity_context's real count_recent() query
+# something to find) is only a meaningful mechanism for card_testing (stack
+# several within the 10-minute window on the same account/device) and
+# loosely mule_activity. It's deliberately omitted for account_takeover
+# (the pattern's essence is a genuinely *new* device -- recent_device_
+# count_10min should read 0) and isn't used at all for merchant_fraud/
+# friendly_fraud/benign, which have no velocity signature -- those rely on
+# descriptive payload/flag_reason text instead.
+#
+# Account IDs: acct_thinhistory_1 (1 seeded prior merchant_fraud case) and
+# acct_thinhistory_2 (2 seeded prior account_takeover cases) are reused by
+# exactly one scenario each below, specifically so the real Research Agent's
+# Postgres query finds real similar_cases instead of an empty brief (spec
+# §8). Every other scenario gets its own dedicated synthetic account_id --
+# sharing an account_id across scenarios would let one scenario's Research
+# Brief pick up another scenario's freshly-committed eval case from earlier
+# in the same run, since both write to and read from the same live database.
+#
+# expected_route is ground-truthed against Route (critical/elevated/low),
+# not the LLM's own raw tier self-label -- see decide_route() in
+# coordinator_service.py. Structural note: decide_route only ever returns
+# CRITICAL for pattern in {card_testing, account_takeover}, so every
+# merchant_fraud/mule_activity/friendly_fraud scenario below is
+# ground-truthed elevated (never critical -- that route is structurally
+# unreachable for those patterns regardless of confidence).
+
+scenarios:
+  # --- card_testing (5): rapid small-value auth attempts across a card range ---
+  - id: card_testing_01
+    ground_truth: {pattern: card_testing, expected_route: critical}
+    signal:
+      signal_id: eval_card_testing_01
+      signal_type: transaction
+      account_id: acct_eval_card_testing_01
+      occurred_minutes_ago: 0
+      upstream_score: 0.93
+      flag_reason: "ml_score_0.93_high_velocity_small_amount"
+      payload:
+        amount: 1.00
+        merchant_id: merch_eval_electronics_1
+        device_context: known_device
+        geo_context: usual_location
+        session_flags: {recent_password_reset: false, mfa_completed: true, failed_logins_this_session: 0}
+    prior_signals:
+      - {minutes_ago: 8}
+      - {minutes_ago: 6}
+      - {minutes_ago: 4}
+      - {minutes_ago: 2}
+      - {minutes_ago: 1}
+
+  - id: card_testing_02
+    ground_truth: {pattern: card_testing, expected_route: critical}
+    signal:
+      signal_id: eval_card_testing_02
+      signal_type: transaction
+      account_id: acct_eval_card_testing_02
+      occurred_minutes_ago: 0
+      upstream_score: 0.90
+      flag_reason: "ml_score_0.90_high_velocity_small_amount"
+      payload:
+        amount: 0.50
+        merchant_id: merch_eval_electronics_1
+        device_context: known_device
+        geo_context: usual_location
+        session_flags: {recent_password_reset: false, mfa_completed: true, failed_logins_this_session: 0}
+    prior_signals:
+      - {minutes_ago: 7}
+      - {minutes_ago: 5}
+      - {minutes_ago: 3}
+      - {minutes_ago: 1}
+
+  - id: card_testing_03
+    ground_truth: {pattern: card_testing, expected_route: critical}
+    signal:
+      signal_id: eval_card_testing_03
+      signal_type: transaction
+      account_id: acct_eval_card_testing_03
+      occurred_minutes_ago: 0
+      upstream_score: 0.95
+      flag_reason: "velocity_rule_7"
+      payload:
+        amount: 2.00
+        merchant_id: merch_eval_subscription_1
+        device_context: new_device
+        geo_context: new_or_foreign_location
+        session_flags: {recent_password_reset: false, mfa_completed: false, failed_logins_this_session: 0}
+    prior_signals:
+      - {minutes_ago: 9, device_context: new_device}
+      - {minutes_ago: 7, device_context: new_device}
+      - {minutes_ago: 5, device_context: new_device}
+      - {minutes_ago: 3, device_context: new_device}
+      - {minutes_ago: 1, device_context: new_device}
+
+  - id: card_testing_04
+    ground_truth: {pattern: card_testing, expected_route: critical}
+    signal:
+      signal_id: eval_card_testing_04
+      signal_type: transaction
+      account_id: acct_eval_card_testing_04
+      occurred_minutes_ago: 0
+      upstream_score: 0.91
+      flag_reason: "ml_score_0.91_card_range_velocity"
+      payload:
+        amount: 1.25
+        merchant_id: merch_eval_giftcards_1
+        device_context: known_device
+        geo_context: new_or_foreign_location
+        session_flags: {recent_password_reset: false, mfa_completed: true, failed_logins_this_session: 0}
+    prior_signals:
+      - {minutes_ago: 8}
+      - {minutes_ago: 6}
+      - {minutes_ago: 4}
+      - {minutes_ago: 2}
+
+  - id: card_testing_05
+    ground_truth: {pattern: card_testing, expected_route: elevated}
+    signal:
+      signal_id: eval_card_testing_05
+      signal_type: transaction
+      account_id: acct_eval_card_testing_05
+      occurred_minutes_ago: 0
+      upstream_score: 0.55
+      flag_reason: "ml_score_0.55_minor_velocity_uptick"
+      payload:
+        amount: 3.50
+        merchant_id: merch_eval_electronics_2
+        device_context: known_device
+        geo_context: usual_location
+        session_flags: {recent_password_reset: false, mfa_completed: true, failed_logins_this_session: 0}
+    prior_signals:
+      - {minutes_ago: 6}
+      - {minutes_ago: 2}
+
+  # --- account_takeover (4): new device + password reset + high-value txn within minutes ---
+  - id: account_takeover_01
+    ground_truth: {pattern: account_takeover, expected_route: critical}
+    signal:
+      signal_id: eval_account_takeover_01
+      signal_type: transaction
+      account_id: acct_thinhistory_2  # seeded: 2 prior account_takeover cases, cleared
+      occurred_minutes_ago: 0
+      upstream_score: 0.94
+      flag_reason: "velocity_rule_new_device_password_reset"
+      payload:
+        amount: 1500.00
+        merchant_id: merch_eval_jewelry_1
+        device_context: new_device
+        geo_context: new_or_foreign_location
+        session_flags: {recent_password_reset: true, mfa_completed: false, failed_logins_this_session: 2}
+
+  - id: account_takeover_02
+    ground_truth: {pattern: account_takeover, expected_route: critical}
+    signal:
+      signal_id: eval_account_takeover_02
+      signal_type: transaction
+      account_id: acct_eval_account_takeover_02
+      occurred_minutes_ago: 0
+      upstream_score: 0.96
+      flag_reason: "velocity_rule_new_device_password_reset"
+      payload:
+        amount: 2200.00
+        merchant_id: merch_eval_electronics_3
+        device_context: new_device
+        geo_context: new_or_foreign_location
+        session_flags: {recent_password_reset: true, mfa_completed: false, failed_logins_this_session: 0}
+
+  - id: account_takeover_03
+    ground_truth: {pattern: account_takeover, expected_route: critical}
+    signal:
+      signal_id: eval_account_takeover_03
+      signal_type: login
+      account_id: acct_eval_account_takeover_03
+      occurred_minutes_ago: 0
+      upstream_score: 0.89
+      flag_reason: "ml_score_0.89_new_device_failed_logins"
+      payload:
+        amount: 980.00
+        merchant_id: merch_eval_travel_1
+        device_context: new_device
+        geo_context: new_or_foreign_location
+        session_flags: {recent_password_reset: true, mfa_completed: false, failed_logins_this_session: 3}
+
+  - id: account_takeover_04
+    ground_truth: {pattern: account_takeover, expected_route: elevated}
+    signal:
+      signal_id: eval_account_takeover_04
+      signal_type: transaction
+      account_id: acct_eval_account_takeover_04
+      occurred_minutes_ago: 0
+      upstream_score: 0.50
+      flag_reason: "ml_score_0.50_new_device_only"
+      payload:
+        amount: 300.00
+        merchant_id: merch_eval_apparel_1
+        device_context: new_device
+        geo_context: usual_location
+        session_flags: {recent_password_reset: false, mfa_completed: true, failed_logins_this_session: 0}
+
+  # --- merchant_fraud (3): chargeback rate spike concentrated at one merchant ---
+  - id: merchant_fraud_01
+    ground_truth: {pattern: merchant_fraud, expected_route: elevated}
+    signal:
+      signal_id: eval_merchant_fraud_01
+      signal_type: chargeback
+      account_id: acct_thinhistory_1  # seeded: 1 prior merchant_fraud case, cleared
+      occurred_minutes_ago: 0
+      upstream_score: 0.72
+      flag_reason: "chargeback_rate_spike_merch_eval_ratespike_1"
+      payload:
+        amount: 145.00
+        merchant_id: merch_eval_ratespike_1
+        device_context: known_device
+        geo_context: usual_location
+        session_flags: {recent_password_reset: false, mfa_completed: true, failed_logins_this_session: 0}
+        merchant_chargeback_rate_7d: 0.14
+        merchant_chargeback_baseline: 0.01
+
+  - id: merchant_fraud_02
+    ground_truth: {pattern: merchant_fraud, expected_route: elevated}
+    signal:
+      signal_id: eval_merchant_fraud_02
+      signal_type: chargeback
+      account_id: acct_eval_merchant_fraud_02
+      occurred_minutes_ago: 0
+      upstream_score: 0.75
+      flag_reason: "chargeback_rate_spike_merch_eval_ratespike_2"
+      payload:
+        amount: 89.00
+        merchant_id: merch_eval_ratespike_2
+        device_context: known_device
+        geo_context: usual_location
+        session_flags: {recent_password_reset: false, mfa_completed: true, failed_logins_this_session: 0}
+        merchant_chargeback_rate_7d: 0.19
+        merchant_chargeback_baseline: 0.02
+
+  - id: merchant_fraud_03
+    ground_truth: {pattern: merchant_fraud, expected_route: elevated}
+    signal:
+      signal_id: eval_merchant_fraud_03
+      signal_type: chargeback
+      account_id: acct_eval_merchant_fraud_03
+      occurred_minutes_ago: 0
+      upstream_score: 0.68
+      flag_reason: "chargeback_rate_spike_merch_eval_ratespike_3"
+      payload:
+        amount: 210.00
+        merchant_id: merch_eval_ratespike_3
+        device_context: known_device
+        geo_context: usual_location
+        session_flags: {recent_password_reset: false, mfa_completed: true, failed_logins_this_session: 0}
+        merchant_chargeback_rate_7d: 0.11
+        merchant_chargeback_baseline: 0.015
+        merchant_newly_onboarded_days_ago: 12
+
+  # --- mule_activity (3): rapid in-and-out transfers across newly linked accounts ---
+  - id: mule_activity_01
+    ground_truth: {pattern: mule_activity, expected_route: elevated}
+    signal:
+      signal_id: eval_mule_activity_01
+      signal_type: transaction
+      account_id: acct_eval_mule_activity_01
+      occurred_minutes_ago: 0
+      upstream_score: 0.70
+      flag_reason: "velocity_rule_mule_in_out_transfer"
+      payload:
+        amount: 4000.00
+        merchant_id: merch_eval_p2p_transfer
+        device_context: new_device
+        geo_context: new_or_foreign_location
+        session_flags: {recent_password_reset: false, mfa_completed: false, failed_logins_this_session: 0}
+        newly_linked_account_days_ago: 1
+        inbound_transfer_minutes_ago: 4
+    prior_signals:
+      - {minutes_ago: 4}
+
+  - id: mule_activity_02
+    ground_truth: {pattern: mule_activity, expected_route: elevated}
+    signal:
+      signal_id: eval_mule_activity_02
+      signal_type: transaction
+      account_id: acct_eval_mule_activity_02
+      occurred_minutes_ago: 0
+      upstream_score: 0.66
+      flag_reason: "velocity_rule_mule_in_out_transfer"
+      payload:
+        amount: 2500.00
+        merchant_id: merch_eval_p2p_transfer
+        device_context: new_device
+        geo_context: usual_location
+        session_flags: {recent_password_reset: false, mfa_completed: false, failed_logins_this_session: 0}
+        newly_linked_account_days_ago: 2
+        inbound_transfer_minutes_ago: 6
+    prior_signals:
+      - {minutes_ago: 6}
+
+  - id: mule_activity_03
+    ground_truth: {pattern: mule_activity, expected_route: elevated}
+    signal:
+      signal_id: eval_mule_activity_03
+      signal_type: transaction
+      account_id: acct_eval_mule_activity_03
+      occurred_minutes_ago: 0
+      upstream_score: 0.73
+      flag_reason: "ml_score_0.73_rapid_in_out_transfer"
+      payload:
+        amount: 6000.00
+        merchant_id: merch_eval_p2p_transfer
+        device_context: new_device
+        geo_context: new_or_foreign_location
+        session_flags: {recent_password_reset: false, mfa_completed: false, failed_logins_this_session: 0}
+        newly_linked_account_days_ago: 1
+        inbound_transfer_minutes_ago: 3
+    prior_signals:
+      - {minutes_ago: 3}
+
+  # --- friendly_fraud (3): chargeback with prior legitimate purchase history ---
+  - id: friendly_fraud_01
+    ground_truth: {pattern: friendly_fraud, expected_route: elevated}
+    signal:
+      signal_id: eval_friendly_fraud_01
+      signal_type: chargeback
+      account_id: acct_eval_friendly_fraud_01
+      occurred_minutes_ago: 0
+      upstream_score: 0.60
+      flag_reason: "ml_score_0.60_dispute_with_purchase_history"
+      payload:
+        amount: 320.00
+        merchant_id: merch_eval_electronics_1
+        device_context: known_device
+        geo_context: usual_location
+        session_flags: {recent_password_reset: false, mfa_completed: true, failed_logins_this_session: 0}
+        dispute_reason: "item_not_received"
+        prior_purchases_at_merchant: 14
+        account_tenure_days: 900
+
+  - id: friendly_fraud_02
+    ground_truth: {pattern: friendly_fraud, expected_route: elevated}
+    signal:
+      signal_id: eval_friendly_fraud_02
+      signal_type: chargeback
+      account_id: acct_eval_friendly_fraud_02
+      occurred_minutes_ago: 0
+      upstream_score: 0.58
+      flag_reason: "ml_score_0.58_dispute_with_purchase_history"
+      payload:
+        amount: 175.00
+        merchant_id: merch_eval_apparel_2
+        device_context: known_device
+        geo_context: usual_location
+        session_flags: {recent_password_reset: false, mfa_completed: true, failed_logins_this_session: 0}
+        dispute_reason: "not_as_described"
+        prior_purchases_at_merchant: 8
+        account_tenure_days: 620
+
+  - id: friendly_fraud_03
+    ground_truth: {pattern: friendly_fraud, expected_route: elevated}
+    signal:
+      signal_id: eval_friendly_fraud_03
+      signal_type: chargeback
+      account_id: acct_eval_friendly_fraud_03
+      occurred_minutes_ago: 0
+      upstream_score: 0.63
+      flag_reason: "ml_score_0.63_dispute_with_purchase_history"
+      payload:
+        amount: 540.00
+        merchant_id: merch_eval_travel_2
+        device_context: known_device
+        geo_context: usual_location
+        session_flags: {recent_password_reset: false, mfa_completed: true, failed_logins_this_session: 0}
+        dispute_reason: "duplicate_charge"
+        prior_purchases_at_merchant: 21
+        account_tenure_days: 1400
+
+  # --- benign (2): travel-triggered anomaly, legitimate high-value gift purchase ---
+  - id: benign_01
+    ground_truth: {pattern: benign, expected_route: low}
+    signal:
+      signal_id: eval_benign_01
+      signal_type: transaction
+      account_id: acct_eval_benign_01
+      occurred_minutes_ago: 0
+      upstream_score: 0.30
+      flag_reason: "ml_score_0.30_travel_geo_anomaly"
+      payload:
+        amount: 65.00
+        merchant_id: merch_eval_restaurant_1
+        device_context: known_device
+        geo_context: new_or_foreign_location
+        session_flags: {recent_password_reset: false, mfa_completed: true, failed_logins_this_session: 0}
+        travel_notice_on_file: true
+
+  - id: benign_02
+    ground_truth: {pattern: benign, expected_route: low}
+    signal:
+      signal_id: eval_benign_02
+      signal_type: transaction
+      account_id: acct_eval_benign_02
+      occurred_minutes_ago: 0
+      upstream_score: 0.35
+      flag_reason: "ml_score_0.35_high_value_gift_purchase"
+      payload:
+        amount: 800.00
+        merchant_id: merch_eval_jewelry_2
+        device_context: known_device
+        geo_context: usual_location
+        session_flags: {recent_password_reset: false, mfa_completed: true, failed_logins_this_session: 0}
+        seasonal_context: "holiday_gift_purchase"
+        account_tenure_days: 1800
