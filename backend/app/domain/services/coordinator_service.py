@@ -1,3 +1,4 @@
+from contextlib import suppress
 from uuid import UUID
 
 from app.domain.agents import ActionAgent, ResearchAgent, SynthesisAgent, TriageAgent
@@ -73,6 +74,18 @@ class CoordinatorService:
         self._synthesis_agent = synthesis_agent
         self._action_agent = action_agent
 
+    async def _log_case_event(
+        self, signal_id: str, case_id: UUID, *, stage: str, event: CaseEvent
+    ) -> None:
+        try:
+            await self._case_events_repo.log(event)
+        except Exception as exc:
+            raise CoordinatorError(signal_id, stage, exc, case_id=case_id) from exc
+
+    async def _log_case_event_best_effort(self, event: CaseEvent) -> None:
+        with suppress(Exception):
+            await self._case_events_repo.log(event)
+
     async def _velocity_context(self, signal: Signal) -> dict:
         device_context = signal.payload.get("device_context")
         recent_txn_count = await self._signals_log_repo.count_recent(
@@ -106,8 +119,12 @@ class CoordinatorService:
                 )
             except Exception as exc:
                 raise CoordinatorError(signal.signal_id, "persist", exc) from exc
-            await self._case_events_repo.log(
-                CaseEvent(case_id=case.case_id, event_type=CaseEventType.LOGGED_ONLY.value)
+            assert case.case_id is not None
+            await self._log_case_event(
+                signal.signal_id,
+                case.case_id,
+                stage="logged_only",
+                event=CaseEvent(case_id=case.case_id, event_type=CaseEventType.LOGGED_ONLY.value),
             )
             return case
 
@@ -166,59 +183,81 @@ class CoordinatorService:
             )
         except Exception as exc:
             raise CoordinatorError(signal.signal_id, "persist", exc) from exc
+        assert case.case_id is not None
 
         if handoff_warnings:
-            await self._case_events_repo.log(
-                CaseEvent(
+            await self._log_case_event(
+                signal.signal_id,
+                case.case_id,
+                stage="handoff_validation_warning",
+                event=CaseEvent(
                     case_id=case.case_id,
                     event_type=CaseEventType.HANDOFF_VALIDATION_WARNING.value,
                     event_payload={"warnings": handoff_warnings},
-                )
+                ),
             )
 
-        await self._case_events_repo.log(
-            CaseEvent(
+        await self._log_case_event(
+            signal.signal_id,
+            case.case_id,
+            stage="triaged",
+            event=CaseEvent(
                 case_id=case.case_id, event_type=CaseEventType.TRIAGED.value, event_payload=triage.model_dump()
-            )
+            ),
         )
-        await self._case_events_repo.log(
-            CaseEvent(
+        await self._log_case_event(
+            signal.signal_id,
+            case.case_id,
+            stage="researched",
+            event=CaseEvent(
                 case_id=case.case_id,
                 event_type=CaseEventType.RESEARCHED.value,
                 event_payload=research.model_dump(),
-            )
+            ),
         )
-        await self._case_events_repo.log(
-            CaseEvent(
+        await self._log_case_event(
+            signal.signal_id,
+            case.case_id,
+            stage="synthesized",
+            event=CaseEvent(
                 case_id=case.case_id,
                 event_type=CaseEventType.SYNTHESIZED.value,
                 event_payload=recommendation.model_dump(),
-            )
+            ),
         )
         if mismatch:
-            await self._case_events_repo.log(
-                CaseEvent(
+            await self._log_case_event(
+                signal.signal_id,
+                case.case_id,
+                stage="route_recommendation_mismatch",
+                event=CaseEvent(
                     case_id=case.case_id,
                     event_type=CaseEventType.ROUTE_RECOMMENDATION_MISMATCH.value,
                     event_payload={
                         "synthesis_recommended": recommendation.recommended_action,
                         "overridden_to": "block",
                     },
-                )
+                ),
             )
 
         if route == Route.CRITICAL:
-            await self._case_events_repo.log(
-                CaseEvent(case_id=case.case_id, event_type=CaseEventType.AUTO_ESCALATED.value)
+            await self._log_case_event(
+                signal.signal_id,
+                case.case_id,
+                stage="auto_escalated",
+                event=CaseEvent(case_id=case.case_id, event_type=CaseEventType.AUTO_ESCALATED.value),
             )
             try:
                 action_result = await self._action_agent.notify(case)
-                await self._case_events_repo.log(
-                    CaseEvent(
+                await self._log_case_event(
+                    signal.signal_id,
+                    case.case_id,
+                    stage="notified",
+                    event=CaseEvent(
                         case_id=case.case_id,
                         event_type=CaseEventType.NOTIFIED.value,
                         event_payload=action_result.model_dump(mode="json"),
-                    )
+                    ),
                 )
             except Exception as exc:
                 # The case itself is already fully persisted at this point --
@@ -228,7 +267,7 @@ class CoordinatorService:
                 # pipeline_error). Without this, an analyst opening the case
                 # later would see AUTO_ESCALATED with no explanation for why
                 # no Slack message ever arrived.
-                await self._case_events_repo.log(
+                await self._log_case_event_best_effort(
                     CaseEvent(
                         case_id=case.case_id,
                         event_type=CaseEventType.ERROR.value,
@@ -237,8 +276,11 @@ class CoordinatorService:
                 )
                 raise CoordinatorError(signal.signal_id, "notify", exc, case_id=case.case_id) from exc
         else:
-            await self._case_events_repo.log(
-                CaseEvent(case_id=case.case_id, event_type=CaseEventType.QUEUED_FOR_REVIEW.value)
+            await self._log_case_event(
+                signal.signal_id,
+                case.case_id,
+                stage="queued_for_review",
+                event=CaseEvent(case_id=case.case_id, event_type=CaseEventType.QUEUED_FOR_REVIEW.value),
             )
 
         return case

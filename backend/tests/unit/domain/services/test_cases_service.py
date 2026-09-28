@@ -65,10 +65,10 @@ class TestCasesService:
     async def test_approve_executes_action_and_persists_resolution(self):
         service, cases_repo, _case_events_repo, action_agent, _payment_gateway = make_service()
         case_id = uuid4()
-        # update_resolution() is now the atomic claim itself -- its return
-        # value IS the check that the case existed and was claimable, so
-        # there's no separate cases_repo.get() call to stub in the happy path.
         cases_repo.update_resolution.return_value = make_case_dto(
+            case_id=case_id, status=CaseStatus.ERROR, resolution=Resolution.APPROVED, approved_by="analyst_1"
+        )
+        cases_repo.update_status.return_value = make_case_dto(
             case_id=case_id, status=CaseStatus.CLOSED, resolution=Resolution.APPROVED, approved_by="analyst_1"
         )
         action_agent.execute.return_value = ActionResult(
@@ -83,13 +83,22 @@ class TestCasesService:
 
         action_agent.execute.assert_awaited_once()
         cases_repo.update_resolution.assert_awaited_once_with(
-            case_id, resolution=Resolution.APPROVED, status=CaseStatus.CLOSED, approved_by="analyst_1"
+            case_id, resolution=Resolution.APPROVED, status=CaseStatus.ERROR, approved_by="analyst_1"
+        )
+        cases_repo.update_status.assert_awaited_once_with(
+            case_id,
+            current_statuses=(CaseStatus.ERROR,),
+            new_status=CaseStatus.CLOSED,
+            current_resolution=Resolution.APPROVED,
         )
 
     async def test_deny_does_not_call_action_agent(self):
         service, cases_repo, _case_events_repo, action_agent, _payment_gateway = make_service()
         case_id = uuid4()
         cases_repo.update_resolution.return_value = make_case_dto(
+            case_id=case_id, status=CaseStatus.ERROR, resolution=Resolution.DENIED
+        )
+        cases_repo.update_status.return_value = make_case_dto(
             case_id=case_id, status=CaseStatus.CLOSED, resolution=Resolution.DENIED
         )
 
@@ -97,7 +106,13 @@ class TestCasesService:
 
         action_agent.execute.assert_not_called()
         cases_repo.update_resolution.assert_awaited_once_with(
-            case_id, resolution=Resolution.DENIED, status=CaseStatus.CLOSED, approved_by=None
+            case_id, resolution=Resolution.DENIED, status=CaseStatus.ERROR, approved_by=None
+        )
+        cases_repo.update_status.assert_awaited_once_with(
+            case_id,
+            current_statuses=(CaseStatus.ERROR,),
+            new_status=CaseStatus.CLOSED,
+            current_resolution=Resolution.DENIED,
         )
 
     async def test_approve_unknown_case_raises_not_found(self):
@@ -145,7 +160,17 @@ class TestCasesService:
         service, cases_repo, _case_events_repo, action_agent, payment_gateway = make_service()
         case_id = uuid4()
         case = make_case_dto(case_id=case_id, recommended_action="block", stripe_payment_intent_id="pi_1")
+        case.status = CaseStatus.ERROR
+        case.resolution = Resolution.APPROVED
         cases_repo.update_resolution.return_value = case
+        cases_repo.update_status.return_value = make_case_dto(
+            case_id=case_id,
+            status=CaseStatus.CLOSED,
+            resolution=Resolution.APPROVED,
+            approved_by="analyst_1",
+            recommended_action="block",
+            stripe_payment_intent_id="pi_1",
+        )
         action_agent.execute.return_value = ActionResult(
             signal_id="sig_1", action_taken="x", executed_by="a", approved_by="analyst_1",
             timestamp=datetime.now(UTC),
@@ -160,7 +185,17 @@ class TestCasesService:
         service, cases_repo, _case_events_repo, action_agent, payment_gateway = make_service()
         case_id = uuid4()
         case = make_case_dto(case_id=case_id, recommended_action="flag_for_review", stripe_payment_intent_id="pi_1")
+        case.status = CaseStatus.ERROR
+        case.resolution = Resolution.APPROVED
         cases_repo.update_resolution.return_value = case
+        cases_repo.update_status.return_value = make_case_dto(
+            case_id=case_id,
+            status=CaseStatus.CLOSED,
+            resolution=Resolution.APPROVED,
+            approved_by="analyst_1",
+            recommended_action="flag_for_review",
+            stripe_payment_intent_id="pi_1",
+        )
         action_agent.execute.return_value = ActionResult(
             signal_id="sig_1", action_taken="x", executed_by="a", approved_by="analyst_1",
             timestamp=datetime.now(UTC),
@@ -179,7 +214,16 @@ class TestCasesService:
         service, cases_repo, _case_events_repo, _action_agent, payment_gateway = make_service()
         case_id = uuid4()
         case = make_case_dto(case_id=case_id, recommended_action="block", stripe_payment_intent_id="pi_1")
+        case.status = CaseStatus.ERROR
+        case.resolution = Resolution.DENIED
         cases_repo.update_resolution.return_value = case
+        cases_repo.update_status.return_value = make_case_dto(
+            case_id=case_id,
+            status=CaseStatus.CLOSED,
+            resolution=Resolution.DENIED,
+            recommended_action="block",
+            stripe_payment_intent_id="pi_1",
+        )
 
         await service.deny(case_id, "analyst_1")
 
@@ -190,7 +234,16 @@ class TestCasesService:
         service, cases_repo, _case_events_repo, _action_agent, payment_gateway = make_service()
         case_id = uuid4()
         case = make_case_dto(case_id=case_id, recommended_action="clear", stripe_payment_intent_id="pi_1")
+        case.status = CaseStatus.ERROR
+        case.resolution = Resolution.DENIED
         cases_repo.update_resolution.return_value = case
+        cases_repo.update_status.return_value = make_case_dto(
+            case_id=case_id,
+            status=CaseStatus.CLOSED,
+            resolution=Resolution.DENIED,
+            recommended_action="clear",
+            stripe_payment_intent_id="pi_1",
+        )
 
         await service.deny(case_id, "analyst_1")
 
@@ -207,21 +260,29 @@ class TestCasesService:
         case_id = uuid4()
         resolved_case = make_case_dto(
             case_id=case_id,
-            status=CaseStatus.CLOSED,
+            status=CaseStatus.ERROR,
             resolution=Resolution.APPROVED,
             approved_by="analyst_1",
             recommended_action="block",
             stripe_payment_intent_id="pi_1",
         )
         cases_repo.update_resolution.return_value = resolved_case
+        cases_repo.update_status.return_value = make_case_dto(
+            case_id=case_id,
+            status=CaseStatus.CLOSED,
+            resolution=Resolution.APPROVED,
+            approved_by="analyst_1",
+            recommended_action="block",
+            stripe_payment_intent_id="pi_1",
+        )
         action_agent.execute.side_effect = RuntimeError("did not confirm success: missing_scope")
 
         result = await service.approve(case_id, "analyst_1")
 
-        assert result == resolved_case
+        assert result.status == CaseStatus.CLOSED
         assert payment_gateway.cancelled == ["pi_1"]
         cases_repo.update_resolution.assert_awaited_once_with(
-            case_id, resolution=Resolution.APPROVED, status=CaseStatus.CLOSED, approved_by="analyst_1"
+            case_id, resolution=Resolution.APPROVED, status=CaseStatus.ERROR, approved_by="analyst_1"
         )
         logged_types = [call.args[0].event_type for call in case_events_repo.log.call_args_list]
         assert CaseEventType.ERROR.value in logged_types
@@ -232,7 +293,17 @@ class TestCasesService:
         service, cases_repo, _case_events_repo, action_agent, payment_gateway = make_service()
         case_id = uuid4()
         case = make_case_dto(case_id=case_id, recommended_action="block", stripe_payment_intent_id=None)
+        case.status = CaseStatus.ERROR
+        case.resolution = Resolution.APPROVED
         cases_repo.update_resolution.return_value = case
+        cases_repo.update_status.return_value = make_case_dto(
+            case_id=case_id,
+            status=CaseStatus.CLOSED,
+            resolution=Resolution.APPROVED,
+            approved_by="analyst_1",
+            recommended_action="block",
+            stripe_payment_intent_id=None,
+        )
         action_agent.execute.return_value = ActionResult(
             signal_id="sig_1", action_taken="x", executed_by="a", approved_by="analyst_1",
             timestamp=datetime.now(UTC),
@@ -242,3 +313,33 @@ class TestCasesService:
 
         assert payment_gateway.captured == []
         assert payment_gateway.cancelled == []
+
+    async def test_retrying_an_errored_approval_resumes_the_same_resolution(self):
+        service, cases_repo, _case_events_repo, action_agent, payment_gateway = make_service()
+        case_id = uuid4()
+        cases_repo.update_resolution.return_value = None
+        cases_repo.get.return_value = make_case_dto(
+            case_id=case_id,
+            status=CaseStatus.ERROR,
+            resolution=Resolution.APPROVED,
+            approved_by="analyst_1",
+            recommended_action="block",
+            stripe_payment_intent_id="pi_1",
+        )
+        cases_repo.update_status.return_value = make_case_dto(
+            case_id=case_id,
+            status=CaseStatus.CLOSED,
+            resolution=Resolution.APPROVED,
+            approved_by="analyst_1",
+            recommended_action="block",
+            stripe_payment_intent_id="pi_1",
+        )
+        action_agent.execute.return_value = ActionResult(
+            signal_id="sig_1", action_taken="x", executed_by="a", approved_by="analyst_1",
+            timestamp=datetime.now(UTC),
+        )
+
+        result = await service.approve(case_id, "analyst_1")
+
+        assert result.status == CaseStatus.CLOSED
+        assert payment_gateway.cancelled == ["pi_1"]

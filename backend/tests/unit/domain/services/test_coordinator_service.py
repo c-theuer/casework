@@ -272,6 +272,42 @@ class TestCoordinatorServiceHandleSignal:
         assert exc_info.value.stage == "persist"
         assert exc_info.value.case_id is None
 
+    async def test_low_route_event_log_failure_raises_coordinator_error_with_case_id(self):
+        coordinator, mocks = make_coordinator()
+        mocks["triage_agent"].run.return_value = make_triage(pattern="benign", confidence=0.1)
+        returned_case = make_returned_case(status=CaseStatus.CLOSED)
+        mocks["cases_repo"].create.return_value = returned_case
+        mocks["case_events_repo"].log.side_effect = RuntimeError("audit down")
+
+        with pytest.raises(CoordinatorError) as exc_info:
+            await coordinator.handle_signal(make_signal(), source=CaseSource.EVAL)
+
+        assert exc_info.value.stage == "logged_only"
+        assert exc_info.value.case_id == returned_case.case_id
+
+    async def test_post_persist_event_failure_raises_coordinator_error_with_case_id(self):
+        coordinator, mocks = make_coordinator()
+        mocks["triage_agent"].run.return_value = make_triage(pattern="merchant_fraud", confidence=0.6)
+        mocks["research_agent"].run.return_value = ResearchBrief(
+            signal_id="sig_1", matched_rules=["r1"], similar_cases=[], evidence=["e1"]
+        )
+        mocks["synthesis_agent"].run.return_value = CaseRecommendation(
+            signal_id="sig_1",
+            risk_score=0.6,
+            recommended_action="flag_for_review",
+            draft_note="note",
+            requires_human_approval=True,
+        )
+        returned_case = make_returned_case(status=CaseStatus.PENDING_REVIEW)
+        mocks["cases_repo"].create.return_value = returned_case
+        mocks["case_events_repo"].log.side_effect = [None, None, None, RuntimeError("audit down")]
+
+        with pytest.raises(CoordinatorError) as exc_info:
+            await coordinator.handle_signal(make_signal(), source=CaseSource.EVAL)
+
+        assert exc_info.value.stage == "queued_for_review"
+        assert exc_info.value.case_id == returned_case.case_id
+
     async def test_handoff_signal_id_mismatch_logs_a_warning_but_still_persists_the_case(self):
         """A confused/hallucinating model response is a real signal worth
         keeping, but hard-failing the whole pipeline over it would throw
@@ -299,3 +335,27 @@ class TestCoordinatorServiceHandleSignal:
         warnings = warning_events[0].event_payload["warnings"]
         assert any("ResearchBrief.signal_id" in w for w in warnings)
         assert any("requires_human_approval" in w for w in warnings)
+
+    async def test_notify_failure_preserves_coordinator_error_when_error_logging_also_fails(self):
+        coordinator, mocks = make_coordinator()
+        mocks["triage_agent"].run.return_value = make_triage(pattern="card_testing", confidence=0.9)
+        mocks["research_agent"].run.return_value = ResearchBrief(
+            signal_id="sig_1", matched_rules=[], similar_cases=[], evidence=[]
+        )
+        mocks["synthesis_agent"].run.return_value = CaseRecommendation(
+            signal_id="sig_1",
+            risk_score=0.9,
+            recommended_action="block",
+            draft_note="note",
+            requires_human_approval=True,
+        )
+        returned_case = make_returned_case(status=CaseStatus.AUTO_ESCALATED, recommended_action="block")
+        mocks["cases_repo"].create.return_value = returned_case
+        mocks["action_agent"].notify.side_effect = RuntimeError("missing_scope")
+        mocks["case_events_repo"].log.side_effect = [None, None, None, None, RuntimeError("audit down")]
+
+        with pytest.raises(CoordinatorError) as exc_info:
+            await coordinator.handle_signal(make_signal(), source=CaseSource.LIVE_STRIPE)
+
+        assert exc_info.value.stage == "notify"
+        assert exc_info.value.case_id == returned_case.case_id

@@ -110,6 +110,26 @@ def _extract_json(text: str) -> dict:
     return dict(obj)
 
 
+def _tool_result_indicates_failure(content: object) -> bool:
+    if isinstance(content, str):
+        stripped = content.strip()
+        if not stripped:
+            return False
+        try:
+            content = json.loads(stripped)
+        except json.JSONDecodeError:
+            return False
+    if isinstance(content, list):
+        return any(_tool_result_indicates_failure(item) for item in content)
+    if isinstance(content, dict):
+        if content.get("ok") is False or content.get("success") is False:
+            return True
+        status = content.get("status")
+        if isinstance(status, str) and status.lower() in {"error", "failed", "failure"}:
+            return True
+    return False
+
+
 @dataclass
 class _SessionResult:
     text: str
@@ -157,7 +177,9 @@ async def _run_once(
                     tool_calls.append(block.name)
         elif isinstance(message, UserMessage) and isinstance(message.content, list):
             for block in message.content:
-                if isinstance(block, ToolResultBlock) and block.is_error:
+                if isinstance(block, ToolResultBlock) and (
+                    block.is_error or _tool_result_indicates_failure(block.content)
+                ):
                     tool_errors.append(str(block.content))
     return _SessionResult(text="".join(text_parts), tool_calls=tool_calls, tool_errors=tool_errors)
 

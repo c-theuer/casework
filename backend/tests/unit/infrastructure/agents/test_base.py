@@ -209,7 +209,7 @@ class TestRunAgentFreeform:
                 text_after=f"Could not post: missing_scope.\n{STATUS_FAILED}"
             ):
                 yield msg
-            yield _user_tool_result(is_error=False, content='{"ok": false, "error": "missing_scope"}')
+            yield _user_tool_result(is_error=False, content='{"ok": true}')
 
         with (
             patch("app.infrastructure.agents.base.query", side_effect=_fake_query),
@@ -217,6 +217,21 @@ class TestRunAgentFreeform:
         ):
             await run_agent_freeform(agent_name="TestAgent", system_prompt="be helpful", prompt="do it")
         assert "did not confirm success" in str(exc_info.value)
+
+    async def test_raises_when_tool_payload_reports_application_level_failure(self):
+        async def _fake_query(*, prompt, options):
+            for msg in _assistant_tool_use(
+                text_after=f"Posted to Slack.\n{STATUS_SUCCESS}"
+            ):
+                yield msg
+            yield _user_tool_result(is_error=False, content='{"ok": false, "error": "missing_scope"}')
+
+        with (
+            patch("app.infrastructure.agents.base.query", side_effect=_fake_query),
+            pytest.raises(AgentActionError) as exc_info,
+        ):
+            await run_agent_freeform(agent_name="TestAgent", system_prompt="be helpful", prompt="do it")
+        assert "tool call(s) failed" in str(exc_info.value)
 
     async def test_raises_when_status_line_is_missing_entirely(self):
         async def _fake_query(*, prompt, options):

@@ -2,8 +2,9 @@ import uuid
 from datetime import UTC, datetime
 from typing import Literal, TypedDict
 
-from app.domain.entities import Case, CaseSource, Route, Signal
+from app.domain.entities import Case, CaseSource, CaseStatus, Resolution, Route, Signal
 from app.domain.gateways import PaymentDeclinedError, PaymentGateway
+from app.domain.repositories import CasesRepository
 from app.domain.services.coordinator_service import CoordinatorError, CoordinatorService
 
 TestCardKey = Literal["elevated", "highest_not_blocked", "highest_blocked"]
@@ -78,10 +79,12 @@ class CheckoutService:
     def __init__(
         self,
         coordinator: CoordinatorService,
+        cases_repo: CasesRepository,
         payment_gateway: PaymentGateway,
         source: CaseSource = CaseSource.LIVE_STRIPE,
     ):
         self._coordinator = coordinator
+        self._cases_repo = cases_repo
         self._payment_gateway = payment_gateway
         self._source = source
 
@@ -170,9 +173,16 @@ class CheckoutService:
             # Nothing ever reviews a low-risk case -- the pipeline itself
             # is the approval, so capture immediately rather than leave the
             # hold dangling until Stripe's own 7-day auto-cancellation.
+            assert case.case_id is not None
             try:
                 await self._payment_gateway.capture(payment_intent_id)
             except Exception as exc:  # noqa: BLE001 -- PaymentGateway is a Protocol; report whatever it raises
+                await self._cases_repo.update_status(
+                    case.case_id,
+                    current_statuses=(CaseStatus.CLOSED,),
+                    new_status=CaseStatus.ERROR,
+                    current_resolution=Resolution.NONE,
+                )
                 return CheckoutResult(
                     risk_level=risk_level,
                     payment_intent_id=payment_intent_id,

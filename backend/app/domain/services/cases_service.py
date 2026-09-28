@@ -1,3 +1,4 @@
+from contextlib import suppress
 from typing import NoReturn
 from uuid import UUID
 
@@ -79,50 +80,77 @@ class CasesService:
             raise CaseAlreadyResolvedError(case_id, case.resolution)
         raise CaseNotActionableError(case_id, case.status)
 
-    async def _resolve_payment(self, case: Case, *, approved: bool) -> None:
+    async def _log_case_event_best_effort(self, event: CaseEvent) -> None:
+        with suppress(Exception):
+            await self._case_events_repo.log(event)
+
+    async def _claim_resolution(
+        self, case_id: UUID, *, resolution: Resolution, approved_by: str | None
+    ) -> Case:
+        claimed = await self._cases_repo.update_resolution(
+            case_id,
+            resolution=resolution,
+            status=CaseStatus.ERROR,
+            approved_by=approved_by,
+        )
+        if claimed is not None:
+            return claimed
+
+        case = await self._cases_repo.get(case_id)
+        if case is None:
+            raise CaseNotFoundError(case_id)
+        if case.status == CaseStatus.ERROR and case.resolution == resolution:
+            return case
+        if case.resolution != Resolution.NONE:
+            raise CaseAlreadyResolvedError(case_id, case.resolution)
+        raise CaseNotActionableError(case_id, case.status)
+
+    async def _close_resolved_case(self, case_id: UUID, *, resolution: Resolution) -> Case:
+        closed = await self._cases_repo.update_status(
+            case_id,
+            current_statuses=(CaseStatus.ERROR,),
+            new_status=CaseStatus.CLOSED,
+            current_resolution=resolution,
+        )
+        if closed is not None:
+            return closed
+        await self._diagnose_resolution_failure(case_id)
+
+    async def _resolve_payment(self, case: Case, *, approved: bool) -> CaseEvent | None:
         # Synthetic/eval/bulk cases never have a real PaymentIntent attached.
         if not case.stripe_payment_intent_id:
-            return
+            return None
         if _should_cancel(case, approved=approved):
             await self._payment_gateway.cancel(case.stripe_payment_intent_id)
             event_type = CaseEventType.PAYMENT_CANCELLED
         else:
             await self._payment_gateway.capture(case.stripe_payment_intent_id)
             event_type = CaseEventType.PAYMENT_CAPTURED
-        await self._case_events_repo.log(
-            CaseEvent(
-                case_id=case.case_id,
-                event_type=event_type.value,
-                event_payload={"payment_intent_id": case.stripe_payment_intent_id},
-            )
+        return CaseEvent(
+            case_id=case.case_id,
+            event_type=event_type.value,
+            event_payload={"payment_intent_id": case.stripe_payment_intent_id},
         )
 
     async def approve(self, case_id: UUID, approved_by: str) -> Case:
-        # Claim first: an atomic, conditional UPDATE (resolution=none AND a
-        # reviewable status) is both the concurrency guard -- two concurrent
-        # approve()/deny() calls for the same case can never both win -- and
-        # what makes a retry safe: once claimed, a second call for the same
-        # case_id fails fast here with CaseAlreadyResolvedError, before ever
-        # reaching _resolve_payment again. Only the winner proceeds to
-        # payment and action side effects.
-        updated = await self._cases_repo.update_resolution(
-            case_id, resolution=Resolution.APPROVED, status=CaseStatus.CLOSED, approved_by=approved_by
+        claimed = await self._claim_resolution(
+            case_id, resolution=Resolution.APPROVED, approved_by=approved_by
         )
-        if updated is None:
-            await self._diagnose_resolution_failure(case_id)
-
-        await self._case_events_repo.log(
-            CaseEvent(case_id=case_id, event_type=CaseEventType.APPROVED.value, event_payload={"approved_by": approved_by})
+        payment_event = await self._resolve_payment(claimed, approved=True)
+        updated = await self._close_resolved_case(case_id, resolution=Resolution.APPROVED)
+        await self._log_case_event_best_effort(
+            CaseEvent(
+                case_id=case_id,
+                event_type=CaseEventType.APPROVED.value,
+                event_payload={"approved_by": approved_by},
+            )
         )
-
-        # Payment is the part that must succeed -- real money -- and the
-        # case's own resolution is already durable at this point. Slack/
-        # GitHub notification is best-effort audit trail on top of that.
-        await self._resolve_payment(updated, approved=True)
+        if payment_event is not None:
+            await self._log_case_event_best_effort(payment_event)
 
         try:
             action_result = await self._action_agent.execute(updated, approved_by)
-            await self._case_events_repo.log(
+            await self._log_case_event_best_effort(
                 CaseEvent(
                     case_id=case_id,
                     event_type=CaseEventType.ACTION_EXECUTED.value,
@@ -130,7 +158,7 @@ class CasesService:
                 )
             )
         except Exception as exc:  # noqa: BLE001 -- ActionAgent is a Protocol; record whatever it raises
-            await self._case_events_repo.log(
+            await self._log_case_event_best_effort(
                 CaseEvent(
                     case_id=case_id,
                     event_type=CaseEventType.ERROR.value,
@@ -141,16 +169,19 @@ class CasesService:
         return updated
 
     async def deny(self, case_id: UUID, denied_by: str) -> Case:
-        updated = await self._cases_repo.update_resolution(
-            case_id, resolution=Resolution.DENIED, status=CaseStatus.CLOSED, approved_by=None
+        claimed = await self._claim_resolution(
+            case_id, resolution=Resolution.DENIED, approved_by=None
         )
-        if updated is None:
-            await self._diagnose_resolution_failure(case_id)
-
-        await self._case_events_repo.log(
-            CaseEvent(case_id=case_id, event_type=CaseEventType.DENIED.value, event_payload={"denied_by": denied_by})
+        payment_event = await self._resolve_payment(claimed, approved=False)
+        updated = await self._close_resolved_case(case_id, resolution=Resolution.DENIED)
+        await self._log_case_event_best_effort(
+            CaseEvent(
+                case_id=case_id,
+                event_type=CaseEventType.DENIED.value,
+                event_payload={"denied_by": denied_by},
+            )
         )
-
-        await self._resolve_payment(updated, approved=False)
+        if payment_event is not None:
+            await self._log_case_event_best_effort(payment_event)
 
         return updated

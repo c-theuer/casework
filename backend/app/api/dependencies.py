@@ -114,9 +114,10 @@ def get_coordinator_service(
 
 def get_checkout_service(
     coordinator: CoordinatorService = Depends(get_coordinator_service),
+    cases_repo: CasesRepository = Depends(get_cases_repository),
     payment_gateway: PaymentGateway = Depends(get_payment_gateway),
 ) -> CheckoutService:
-    return CheckoutService(coordinator, payment_gateway)
+    return CheckoutService(coordinator, cases_repo, payment_gateway)
 
 
 def get_cases_service(

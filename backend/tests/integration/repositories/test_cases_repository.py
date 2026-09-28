@@ -91,6 +91,13 @@ class TestCasesRepository:
         assert elevated.case_id in ids
         assert critical.case_id in ids
 
+    async def test_list_pending_includes_error_cases(self, cases_repo):
+        errored = await cases_repo.create(make_case_dto(status=CaseStatus.ERROR))
+
+        ids = [c.case_id for c in await cases_repo.list_pending()]
+
+        assert errored.case_id in ids
+
     async def test_list_pending_excludes_closed_cases(self, cases_repo):
         closed = await cases_repo.create(make_case_dto(status=CaseStatus.CLOSED))
 
@@ -151,6 +158,19 @@ class TestCasesRepository:
         )
 
         assert result is None
+
+    async def test_update_status_changes_only_matching_rows(self, cases_repo):
+        case = await cases_repo.create(make_case_dto(status=CaseStatus.CLOSED, resolution=Resolution.NONE))
+
+        updated = await cases_repo.update_status(
+            case.case_id,
+            current_statuses=(CaseStatus.CLOSED,),
+            new_status=CaseStatus.ERROR,
+            current_resolution=Resolution.NONE,
+        )
+
+        assert updated is not None
+        assert updated.status == CaseStatus.ERROR
 
     async def test_find_similar_matches_by_account_id_or_pattern(self, cases_repo):
         same_account = await cases_repo.create(
