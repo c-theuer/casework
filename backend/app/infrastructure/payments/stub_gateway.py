@@ -22,6 +22,7 @@ class StubPaymentGateway(PaymentGateway):
     def __init__(self) -> None:
         self.captured: list[str] = []
         self.cancelled: list[str] = []
+        self._statuses: dict[str, str] = {}
 
     async def authorize(self, *, amount: float, test_card_token: str) -> AuthorizationResult:
         if test_card_token not in _RISK_LEVEL_BY_TOKEN:
@@ -29,12 +30,17 @@ class StubPaymentGateway(PaymentGateway):
         risk_level = _RISK_LEVEL_BY_TOKEN[test_card_token]
         if test_card_token == _BLOCKED_TOKEN:
             raise PaymentDeclinedError(risk_level)
-        return AuthorizationResult(
-            risk_level=risk_level, payment_intent_id=f"pi_stub_{uuid.uuid4().hex[:16]}"
-        )
+        payment_intent_id = f"pi_stub_{uuid.uuid4().hex[:16]}"
+        self._statuses[payment_intent_id] = "requires_capture"
+        return AuthorizationResult(risk_level=risk_level, payment_intent_id=payment_intent_id)
 
     async def capture(self, payment_intent_id: str) -> None:
         self.captured.append(payment_intent_id)
+        self._statuses[payment_intent_id] = "succeeded"
 
     async def cancel(self, payment_intent_id: str) -> None:
         self.cancelled.append(payment_intent_id)
+        self._statuses[payment_intent_id] = "canceled"
+
+    async def get_status(self, payment_intent_id: str) -> str:
+        return self._statuses.get(payment_intent_id, "requires_capture")

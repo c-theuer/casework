@@ -177,17 +177,27 @@ class CheckoutService:
             try:
                 await self._payment_gateway.capture(payment_intent_id)
             except Exception as exc:  # noqa: BLE001 -- PaymentGateway is a Protocol; report whatever it raises
-                await self._cases_repo.update_status(
-                    case.case_id,
-                    current_statuses=(CaseStatus.CLOSED,),
-                    new_status=CaseStatus.ERROR,
-                    current_resolution=Resolution.NONE,
-                )
+                retry_error = ""
+                try:
+                    updated = await self._cases_repo.update_status(
+                        case.case_id,
+                        current_statuses=(CaseStatus.CLOSED,),
+                        new_status=CaseStatus.ERROR,
+                        current_resolution=Resolution.NONE,
+                    )
+                    if updated is None:
+                        retry_error = (
+                            " The case could not be moved into a recoverable retry state; manual review is required."
+                        )
+                except Exception as update_exc:  # noqa: BLE001 -- CasesRepository is a Protocol; report whatever it raises
+                    retry_error = (
+                        f" Updating the case for retry also failed: {update_exc}; manual review is required."
+                    )
                 return CheckoutResult(
                     risk_level=risk_level,
                     payment_intent_id=payment_intent_id,
                     case=case,
-                    pipeline_error=f"Case auto-cleared but capturing the authorization failed: {exc}",
+                    pipeline_error=f"Case auto-cleared but capturing the authorization failed: {exc}.{retry_error}",
                 )
 
         return CheckoutResult(risk_level=risk_level, payment_intent_id=payment_intent_id, case=case)

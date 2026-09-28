@@ -215,3 +215,25 @@ class TestCheckoutService:
             new_status=CaseStatus.ERROR,
             current_resolution=Resolution.NONE,
         )
+
+    async def test_low_route_capture_failure_flags_manual_review_if_retry_state_is_not_saved(self):
+        service, coordinator, cases_repo, payment_gateway = make_service()
+        coordinator.handle_signal.return_value.case_id = uuid4()
+        coordinator.handle_signal.return_value.status = CaseStatus.CLOSED
+        coordinator.handle_signal.return_value.route = Route.LOW
+        payment_gateway.capture = AsyncMock(side_effect=RuntimeError("stripe unreachable"))
+        cases_repo.update_status.return_value = None
+
+        result = await service.checkout(
+            account_id="acct_1",
+            amount=10.0,
+            merchant_id="m1",
+            device_context="known_device",
+            geo_context="usual_location",
+            recent_password_reset=False,
+            mfa_completed=True,
+            failed_logins_this_session=0,
+            test_card="elevated",
+        )
+
+        assert "manual review is required" in result.pipeline_error

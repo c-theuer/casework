@@ -120,6 +120,21 @@ class CasesService:
         # Synthetic/eval/bulk cases never have a real PaymentIntent attached.
         if not case.stripe_payment_intent_id:
             return None
+        expected_status = "canceled" if _should_cancel(case, approved=approved) else "succeeded"
+        current_status = await self._payment_gateway.get_status(case.stripe_payment_intent_id)
+        if current_status == expected_status:
+            event_type = (
+                CaseEventType.PAYMENT_CANCELLED if expected_status == "canceled" else CaseEventType.PAYMENT_CAPTURED
+            )
+            return CaseEvent(
+                case_id=case.case_id,
+                event_type=event_type.value,
+                event_payload={"payment_intent_id": case.stripe_payment_intent_id},
+            )
+        if current_status != "requires_capture":
+            raise RuntimeError(
+                f"PaymentIntent {case.stripe_payment_intent_id} is in unexpected status {current_status!r}"
+            )
         if _should_cancel(case, approved=approved):
             await self._payment_gateway.cancel(case.stripe_payment_intent_id)
             event_type = CaseEventType.PAYMENT_CANCELLED

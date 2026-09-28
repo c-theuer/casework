@@ -343,3 +343,34 @@ class TestCasesService:
 
         assert result.status == CaseStatus.CLOSED
         assert payment_gateway.cancelled == ["pi_1"]
+
+    async def test_retrying_an_errored_approval_skips_payment_if_it_already_succeeded(self):
+        service, cases_repo, _case_events_repo, action_agent, payment_gateway = make_service()
+        case_id = uuid4()
+        cases_repo.update_resolution.return_value = None
+        cases_repo.get.return_value = make_case_dto(
+            case_id=case_id,
+            status=CaseStatus.ERROR,
+            resolution=Resolution.APPROVED,
+            approved_by="analyst_1",
+            recommended_action="block",
+            stripe_payment_intent_id="pi_1",
+        )
+        payment_gateway._statuses["pi_1"] = "canceled"
+        cases_repo.update_status.return_value = make_case_dto(
+            case_id=case_id,
+            status=CaseStatus.CLOSED,
+            resolution=Resolution.APPROVED,
+            approved_by="analyst_1",
+            recommended_action="block",
+            stripe_payment_intent_id="pi_1",
+        )
+        action_agent.execute.return_value = ActionResult(
+            signal_id="sig_1", action_taken="x", executed_by="a", approved_by="analyst_1",
+            timestamp=datetime.now(UTC),
+        )
+
+        result = await service.approve(case_id, "analyst_1")
+
+        assert result.status == CaseStatus.CLOSED
+        assert payment_gateway.cancelled == []

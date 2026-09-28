@@ -75,3 +75,7 @@ class StripePaymentGateway(PaymentGateway):
 
     async def cancel(self, payment_intent_id: str) -> None:
         await self._client.v1.payment_intents.cancel_async(payment_intent_id)
+
+    async def get_status(self, payment_intent_id: str) -> str:
+        intent = await self._client.v1.payment_intents.retrieve_async(payment_intent_id)
+        return intent.status
