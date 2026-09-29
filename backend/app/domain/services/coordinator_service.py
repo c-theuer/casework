@@ -1,4 +1,4 @@
-from contextlib import suppress
+import logging
 from uuid import UUID
 
 from app.domain.agents import ActionAgent, ResearchAgent, SynthesisAgent, TriageAgent
@@ -15,6 +15,8 @@ from app.domain.entities import (
     TriageResult,
 )
 from app.domain.repositories import CaseEventsRepository, CasesRepository, SignalsLogRepository
+
+logger = logging.getLogger(__name__)
 
 
 class CoordinatorError(Exception):
@@ -83,8 +85,16 @@ class CoordinatorService:
             raise CoordinatorError(signal_id, stage, exc, case_id=case_id) from exc
 
     async def _log_case_event_best_effort(self, event: CaseEvent) -> None:
-        with suppress(Exception):
+        try:
             await self._case_events_repo.log(event)
+        except Exception:
+            # Best-effort by design (see call site) -- but silently dropping
+            # this would mean the original failure it's trying to record
+            # leaves no trace anywhere if this write also fails.
+            logger.exception(
+                "best-effort case_events write failed",
+                extra={"case_id": str(event.case_id), "event_type": event.event_type},
+            )
 
     async def _velocity_context(self, signal: Signal) -> dict:
         device_context = signal.payload.get("device_context")
@@ -99,18 +109,32 @@ class CoordinatorService:
         return result
 
     async def handle_signal(self, signal: Signal, source: CaseSource) -> Case:
+        logger.info(
+            "pipeline started", extra={"signal_id": signal.signal_id, "source": source.value}
+        )
         try:
             await self._signals_log_repo.log(_signal_to_log_entry(signal, source))
         except Exception as exc:
+            logger.exception("pipeline stage failed", extra={"signal_id": signal.signal_id, "stage": "signal_log"})
             raise CoordinatorError(signal.signal_id, "signal_log", exc) from exc
 
         try:
             velocity_context = await self._velocity_context(signal)
             triage = await self._triage_agent.run(signal, velocity_context)
         except Exception as exc:
+            logger.exception("pipeline stage failed", extra={"signal_id": signal.signal_id, "stage": "triage"})
             raise CoordinatorError(signal.signal_id, "triage", exc) from exc
 
         route = decide_route(triage)
+        logger.info(
+            "route decided",
+            extra={
+                "signal_id": signal.signal_id,
+                "pattern": triage.pattern,
+                "confidence": triage.confidence,
+                "route": route.value,
+            },
+        )
 
         if route == Route.LOW:
             try:
@@ -118,6 +142,9 @@ class CoordinatorService:
                     _build_case_dto(signal, triage, route, CaseStatus.CLOSED, source)
                 )
             except Exception as exc:
+                logger.exception(
+                    "pipeline stage failed", extra={"signal_id": signal.signal_id, "stage": "persist"}
+                )
                 raise CoordinatorError(signal.signal_id, "persist", exc) from exc
             assert case.case_id is not None
             await self._log_case_event(
@@ -126,12 +153,20 @@ class CoordinatorService:
                 stage="logged_only",
                 event=CaseEvent(case_id=case.case_id, event_type=CaseEventType.LOGGED_ONLY.value),
             )
+            logger.info(
+                "pipeline finished",
+                extra={"signal_id": signal.signal_id, "case_id": str(case.case_id), "status": case.status.value},
+            )
             return case
 
         try:
             research = await self._research_agent.run(triage)
             recommendation = await self._synthesis_agent.run(triage, research)
         except Exception as exc:
+            logger.exception(
+                "pipeline stage failed",
+                extra={"signal_id": signal.signal_id, "stage": "research_or_synthesis"},
+            )
             raise CoordinatorError(signal.signal_id, "research_or_synthesis", exc) from exc
 
         # Defensive validation of the LLM's own structured handoffs: neither
@@ -182,6 +217,7 @@ class CoordinatorService:
                 )
             )
         except Exception as exc:
+            logger.exception("pipeline stage failed", extra={"signal_id": signal.signal_id, "stage": "persist"})
             raise CoordinatorError(signal.signal_id, "persist", exc) from exc
         assert case.case_id is not None
 
@@ -267,6 +303,10 @@ class CoordinatorService:
                 # pipeline_error). Without this, an analyst opening the case
                 # later would see AUTO_ESCALATED with no explanation for why
                 # no Slack message ever arrived.
+                logger.exception(
+                    "pipeline stage failed",
+                    extra={"signal_id": signal.signal_id, "stage": "notify", "case_id": str(case.case_id)},
+                )
                 await self._log_case_event_best_effort(
                     CaseEvent(
                         case_id=case.case_id,
@@ -283,6 +323,10 @@ class CoordinatorService:
                 event=CaseEvent(case_id=case.case_id, event_type=CaseEventType.QUEUED_FOR_REVIEW.value),
             )
 
+        logger.info(
+            "pipeline finished",
+            extra={"signal_id": signal.signal_id, "case_id": str(case.case_id), "status": case.status.value},
+        )
         return case
 
 

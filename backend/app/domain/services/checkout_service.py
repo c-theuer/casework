@@ -1,3 +1,4 @@
+import logging
 import uuid
 from datetime import UTC, datetime
 from typing import Literal, TypedDict
@@ -6,6 +7,8 @@ from app.domain.entities import Case, CaseSource, CaseStatus, Resolution, Route,
 from app.domain.gateways import PaymentDeclinedError, PaymentGateway
 from app.domain.repositories import CasesRepository
 from app.domain.services.coordinator_service import CoordinatorError, CoordinatorService
+
+logger = logging.getLogger(__name__)
 
 TestCardKey = Literal["elevated", "highest_not_blocked", "highest_blocked"]
 
@@ -114,6 +117,10 @@ class CheckoutService:
         test_card: TestCardKey,
     ) -> CheckoutResult:
         risk_level, payment_intent_id = await self._authorize(test_card, amount)
+        logger.info(
+            "payment intent authorized",
+            extra={"risk_level": risk_level, "payment_intent_id": payment_intent_id, "amount": amount},
+        )
 
         upstream_score = _RISK_LEVEL_TO_SCORE[risk_level]
         flag_reason = f"stripe_radar_{risk_level}"
@@ -156,10 +163,23 @@ class CheckoutService:
                 try:
                     await self._payment_gateway.cancel(payment_intent_id)
                     pipeline_error = f"{exc} (no case was created; the authorization was cancelled)"
+                    logger.warning(
+                        "pipeline failed with no case created; dangling authorization auto-cancelled",
+                        extra={"payment_intent_id": payment_intent_id, "signal_id": signal.signal_id},
+                    )
                 except Exception as cancel_exc:  # noqa: BLE001 -- PaymentGateway is a Protocol; report whatever it raises
                     pipeline_error = (
                         f"{exc} (no case was created, AND cancelling the dangling authorization also "
                         f"failed: {cancel_exc} -- payment_intent_id {payment_intent_id} needs manual review)"
+                    )
+                    logger.error(
+                        "pipeline failed with no case created, AND cancelling the dangling authorization "
+                        "also failed -- payment_intent_id needs manual review",
+                        extra={
+                            "payment_intent_id": payment_intent_id,
+                            "signal_id": signal.signal_id,
+                            "cancel_error": str(cancel_exc),
+                        },
                     )
             else:
                 pipeline_error = str(exc)
@@ -193,6 +213,15 @@ class CheckoutService:
                     retry_error = (
                         f" Updating the case for retry also failed: {update_exc}; manual review is required."
                     )
+                logger.error(
+                    "auto-cleared low-risk case failed to capture its authorization",
+                    extra={
+                        "payment_intent_id": payment_intent_id,
+                        "case_id": str(case.case_id),
+                        "capture_error": str(exc),
+                        "retry_error": retry_error,
+                    },
+                )
                 return CheckoutResult(
                     risk_level=risk_level,
                     payment_intent_id=payment_intent_id,

@@ -1,4 +1,4 @@
-from contextlib import suppress
+import logging
 from typing import NoReturn
 from uuid import UUID
 
@@ -6,6 +6,8 @@ from app.domain.agents import ActionAgent
 from app.domain.entities import Case, CaseEvent, CaseEventType, CaseStatus, Resolution
 from app.domain.gateways import PaymentGateway
 from app.domain.repositories import CaseEventsRepository, CasesRepository
+
+logger = logging.getLogger(__name__)
 
 
 class CaseNotFoundError(Exception):
@@ -81,8 +83,13 @@ class CasesService:
         raise CaseNotActionableError(case_id, case.status)
 
     async def _log_case_event_best_effort(self, event: CaseEvent) -> None:
-        with suppress(Exception):
+        try:
             await self._case_events_repo.log(event)
+        except Exception:
+            logger.exception(
+                "best-effort case_events write failed",
+                extra={"case_id": str(event.case_id), "event_type": event.event_type},
+            )
 
     async def _claim_resolution(
         self, case_id: UUID, *, resolution: Resolution, approved_by: str | None
@@ -96,6 +103,10 @@ class CasesService:
         if claimed is not None:
             return claimed
 
+        logger.info(
+            "resolution claim rejected by atomic update; diagnosing why",
+            extra={"case_id": str(case_id), "resolution": resolution.value},
+        )
         case = await self._cases_repo.get(case_id)
         if case is None:
             raise CaseNotFoundError(case_id)
@@ -128,6 +139,14 @@ class CasesService:
             event_type = (
                 CaseEventType.PAYMENT_CANCELLED if expected_status == "canceled" else CaseEventType.PAYMENT_CAPTURED
             )
+            logger.info(
+                "payment already in expected terminal status; skipping capture/cancel call",
+                extra={
+                    "case_id": str(case.case_id),
+                    "payment_intent_id": case.stripe_payment_intent_id,
+                    "status": current_status,
+                },
+            )
             return CaseEvent(
                 case_id=case.case_id,
                 event_type=event_type.value,
@@ -143,6 +162,14 @@ class CasesService:
         else:
             await self._payment_gateway.capture(case.stripe_payment_intent_id)
             event_type = CaseEventType.PAYMENT_CAPTURED
+        logger.info(
+            "payment resolved",
+            extra={
+                "case_id": str(case.case_id),
+                "payment_intent_id": case.stripe_payment_intent_id,
+                "event_type": event_type.value,
+            },
+        )
         return CaseEvent(
             case_id=case.case_id,
             event_type=event_type.value,
@@ -174,7 +201,11 @@ class CasesService:
                     event_payload=action_result.model_dump(mode="json"),
                 )
             )
-        except Exception as exc:  # noqa: BLE001 -- ActionAgent is a Protocol; record whatever it raises
+        except Exception as exc:
+            logger.exception(
+                "case action execution failed",
+                extra={"case_id": str(case_id), "approved_by": approved_by},
+            )
             await self._log_case_event_best_effort(
                 CaseEvent(
                     case_id=case_id,

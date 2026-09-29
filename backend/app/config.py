@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     db_name: str = "casework"
 
     frontend_origin: str = "http://localhost:5173"
+    log_level: str = "INFO"
 
     @property
     def db_dsn(self) -> str:

@@ -336,7 +336,13 @@ class TestCoordinatorServiceHandleSignal:
         assert any("ResearchBrief.signal_id" in w for w in warnings)
         assert any("requires_human_approval" in w for w in warnings)
 
-    async def test_notify_failure_preserves_coordinator_error_when_error_logging_also_fails(self):
+    async def test_notify_failure_preserves_coordinator_error_when_error_logging_also_fails(self, caplog):
+        """Before logging was added, a notify() failure whose own
+        case_events audit-trail write ALSO failed left no trace anywhere:
+        the CoordinatorError is still raised and caught upstream, but
+        nothing durable records why. logger.exception() in
+        _log_case_event_best_effort is what closes that gap."""
+        caplog.set_level("ERROR")
         coordinator, mocks = make_coordinator()
         mocks["triage_agent"].run.return_value = make_triage(pattern="card_testing", confidence=0.9)
         mocks["research_agent"].run.return_value = ResearchBrief(
@@ -359,3 +365,7 @@ class TestCoordinatorServiceHandleSignal:
 
         assert exc_info.value.stage == "notify"
         assert exc_info.value.case_id == returned_case.case_id
+        assert "pipeline stage failed" in caplog.text
+        assert "missing_scope" in caplog.text
+        assert "best-effort case_events write failed" in caplog.text
+        assert "audit down" in caplog.text

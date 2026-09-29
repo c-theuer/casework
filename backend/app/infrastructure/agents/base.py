@@ -10,6 +10,8 @@ and why it failed, not a continued conversation.
 """
 
 import json
+import logging
+import time
 from dataclasses import dataclass, field
 
 from claude_agent_sdk import (
@@ -23,6 +25,8 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import McpServerConfig
 from pydantic import BaseModel, ValidationError
+
+logger = logging.getLogger(__name__)
 
 
 class AgentOutputError(Exception):
@@ -211,6 +215,15 @@ async def run_agent_freeform(
     action happened; only the actual tool-call trace *and* an explicit
     checkable success marker are. On success, returns the response text
     with that status line stripped off."""
+    logger.info(
+        "agent call starting",
+        extra={
+            "agent_name": agent_name,
+            "mcp_servers": list((mcp_servers or {}).keys()),
+            "allowed_tools": allowed_tools or [],
+        },
+    )
+    start = time.monotonic()
     result = await _run_once(
         system_prompt=system_prompt,
         prompt=prompt,
@@ -218,20 +231,50 @@ async def run_agent_freeform(
         allowed_tools=allowed_tools or [],
         model=model,
     )
+    elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+
     if not result.tool_calls or result.tool_errors:
-        raise AgentActionError(agent_name, result.text, result.tool_calls, result.tool_errors)
+        exc = AgentActionError(agent_name, result.text, result.tool_calls, result.tool_errors)
+        logger.error(
+            "agent call failed: %s",
+            exc,
+            extra={"agent_name": agent_name, "elapsed_ms": elapsed_ms, "tool_calls": result.tool_calls},
+        )
+        raise exc
 
     missing_tools = [t for t in (required_tools or []) if t not in result.tool_calls]
     if missing_tools:
-        raise AgentActionError(
+        exc = AgentActionError(
             agent_name, result.text, result.tool_calls, result.tool_errors, missing_tools=missing_tools
         )
+        logger.error(
+            "agent call failed: %s",
+            exc,
+            extra={"agent_name": agent_name, "elapsed_ms": elapsed_ms, "tool_calls": result.tool_calls},
+        )
+        raise exc
 
     text = result.text.strip()
     lines = text.splitlines()
     last_line = lines[-1].strip() if lines else ""
     if last_line != STATUS_SUCCESS:
-        raise AgentActionError(agent_name, text, result.tool_calls, result.tool_errors)
+        exc = AgentActionError(agent_name, text, result.tool_calls, result.tool_errors)
+        logger.error(
+            "agent call failed: %s",
+            exc,
+            extra={"agent_name": agent_name, "elapsed_ms": elapsed_ms, "tool_calls": result.tool_calls},
+        )
+        raise exc
+
+    logger.info(
+        "agent call finished",
+        extra={
+            "agent_name": agent_name,
+            "tool_calls": result.tool_calls,
+            "tool_error_count": len(result.tool_errors),
+            "elapsed_ms": elapsed_ms,
+        },
+    )
     return "\n".join(lines[:-1]).strip()
 
 
@@ -255,7 +298,17 @@ async def run_agent[ModelT: BaseModel](
 
     raw_text = ""
     last_error: Exception = AgentOutputError(agent_name, "", RuntimeError("unreachable"))
-    for _ in range(max_retries + 1):
+    for attempt in range(1, max_retries + 2):
+        logger.info(
+            "agent call starting",
+            extra={
+                "agent_name": agent_name,
+                "attempt": attempt,
+                "mcp_servers": list((mcp_servers or {}).keys()),
+                "allowed_tools": allowed_tools or [],
+            },
+        )
+        start = time.monotonic()
         result = await _run_once(
             system_prompt=system_prompt,
             prompt=prompt,
@@ -263,15 +316,34 @@ async def run_agent[ModelT: BaseModel](
             allowed_tools=allowed_tools or [],
             model=model,
         )
+        elapsed_ms = round((time.monotonic() - start) * 1000, 1)
         raw_text = result.text
         try:
-            return output_model.model_validate(_extract_json(raw_text))
+            validated = output_model.model_validate(_extract_json(raw_text))
         except (json.JSONDecodeError, ValidationError) as exc:
             last_error = exc
+            logger.warning(
+                "agent call produced invalid output, retrying" if attempt <= max_retries else "agent call failed",
+                extra={"agent_name": agent_name, "attempt": attempt, "elapsed_ms": elapsed_ms, "error": str(exc)},
+            )
             prompt = (
                 f"{prompt}\n\nYour previous response was:\n{raw_text}\n\n"
                 f"That failed validation with this error:\n{exc}\n\n"
                 "Try again. Respond with ONLY a single JSON object matching the schema above."
             )
+            continue
+        logger.info(
+            "agent call finished",
+            extra={
+                "agent_name": agent_name,
+                "attempt": attempt,
+                "tool_calls": result.tool_calls,
+                "tool_error_count": len(result.tool_errors),
+                "elapsed_ms": elapsed_ms,
+            },
+        )
+        return validated
 
-    raise AgentOutputError(agent_name, raw_text, last_error)
+    output_error = AgentOutputError(agent_name, raw_text, last_error)
+    logger.error("agent call failed: %s", output_error, extra={"agent_name": agent_name})
+    raise output_error
